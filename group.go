@@ -1,0 +1,99 @@
+package gopresentation
+
+// GroupShape represents a group of shapes.
+type GroupShape struct {
+	BaseShape
+	shapes []Shape
+}
+
+// ShapeTypeGroup is the shape type for groups.
+const ShapeTypeGroup ShapeType = 10
+
+func (g *GroupShape) GetType() ShapeType { return ShapeTypeGroup }
+
+// NewGroupShape creates a new group shape.
+func NewGroupShape() *GroupShape {
+	return &GroupShape{
+		shapes: make([]Shape, 0),
+	}
+}
+
+// AddShape adds a shape to the group.
+func (g *GroupShape) AddShape(s Shape) *GroupShape {
+	g.shapes = append(g.shapes, s)
+	return g
+}
+
+// GetShapes returns all shapes in the group.
+func (g *GroupShape) GetShapes() []Shape {
+	return g.shapes
+}
+
+// GetShapeCount returns the number of shapes in the group.
+func (g *GroupShape) GetShapeCount() int {
+	return len(g.shapes)
+}
+
+// RemoveShape removes a shape by index.
+func (g *GroupShape) RemoveShape(index int) error {
+	if index < 0 || index >= len(g.shapes) {
+		return errOutOfRange
+	}
+	g.shapes = append(g.shapes[:index], g.shapes[index+1:]...)
+	return nil
+}
+
+// PlaceholderShape represents a placeholder shape (title, body, etc.).
+type PlaceholderShape struct {
+	RichTextShape
+	phType PlaceholderType
+	phIdx  int
+}
+
+// ShapeTypePlaceholder is the shape type for placeholders.
+const ShapeTypePlaceholder ShapeType = 11
+
+func (p *PlaceholderShape) GetType() ShapeType { return ShapeTypePlaceholder }
+
+// PlaceholderType represents the type of placeholder.
+type PlaceholderType string
+
+const (
+	PlaceholderTitle    PlaceholderType = "title"
+	PlaceholderBody     PlaceholderType = "body"
+	PlaceholderCtrTitle PlaceholderType = "ctrTitle"
+	PlaceholderSubTitle PlaceholderType = "subTitle"
+	PlaceholderDate     PlaceholderType = "dt"
+	PlaceholderFooter   PlaceholderType = "ftr"
+	PlaceholderSlideNum PlaceholderType = "sldNum"
+)
+
+// NewPlaceholderShape creates a new placeholder shape.
+func NewPlaceholderShape(phType PlaceholderType) *PlaceholderShape {
+	return &PlaceholderShape{
+		RichTextShape: *NewRichTextShape(),
+		phType:        phType,
+	}
+}
+
+// GetPlaceholderType returns the placeholder type.
+func (p *PlaceholderShape) GetPlaceholderType() PlaceholderType {
+	return p.phType
+}
+
+// SetPlaceholderIndex sets the placeholder index.
+func (p *PlaceholderShape) SetPlaceholderIndex(idx int) {
+	p.phIdx = idx
+}
+
+// GetPlaceholderIndex returns the placeholder index.
+func (p *PlaceholderShape) GetPlaceholderIndex() int {
+	return p.phIdx
+}
+
+// errors
+var errOutOfRange = errorString("index out of range")
+
+type errorString string
+
+func (e errorString) Error() string { return string(e) }

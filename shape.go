@@ -1,0 +1,619 @@
+package gopresentation
+
+// Shape is the interface that all shapes implement.
+type Shape interface {
+	GetType() ShapeType
+	GetOffsetX() int64
+	GetOffsetY() int64
+	GetWidth() int64
+	GetHeight() int64
+	GetName() string
+	GetRotation() int
+}
+
+// ShapeType represents the type of shape.
+type ShapeType int
+
+const (
+	ShapeTypeRichText ShapeType = iota
+	ShapeTypeDrawing
+	ShapeTypeTable
+	ShapeTypeAutoShape
+	ShapeTypeLine
+	ShapeTypeChart
+)
+
+// BaseShape contains common shape properties.
+type BaseShape struct {
+	name        string
+	description string
+	offsetX     int64 // in EMU
+	offsetY     int64 // in EMU
+	width       int64 // in EMU
+	height      int64 // in EMU
+	rotation    int   // in degrees
+	fill        *Fill
+	border      *Border
+	shadow      *Shadow
+	hyperlink   *Hyperlink
+}
+
+func (b *BaseShape) GetOffsetX() int64   { return b.offsetX }
+func (b *BaseShape) GetOffsetY() int64   { return b.offsetY }
+func (b *BaseShape) GetWidth() int64     { return b.width }
+func (b *BaseShape) GetHeight() int64    { return b.height }
+func (b *BaseShape) GetName() string     { return b.name }
+func (b *BaseShape) GetRotation() int    { return b.rotation }
+
+func (b *BaseShape) SetOffsetX(x int64) *BaseShape  { b.offsetX = x; return b }
+func (b *BaseShape) SetOffsetY(y int64) *BaseShape  { b.offsetY = y; return b }
+func (b *BaseShape) SetWidth(w int64) *BaseShape     { b.width = w; return b }
+func (b *BaseShape) SetHeight(h int64) *BaseShape    { b.height = h; return b }
+func (b *BaseShape) SetName(n string) *BaseShape     { b.name = n; return b }
+func (b *BaseShape) SetRotation(r int) *BaseShape    { b.rotation = r; return b }
+
+func (b *BaseShape) GetDescription() string          { return b.description }
+func (b *BaseShape) SetDescription(d string)         { b.description = d }
+
+func (b *BaseShape) GetFill() *Fill {
+	if b.fill == nil {
+		b.fill = NewFill()
+	}
+	return b.fill
+}
+
+func (b *BaseShape) SetFill(f *Fill) { b.fill = f }
+
+func (b *BaseShape) GetBorder() *Border {
+	if b.border == nil {
+		b.border = NewBorder()
+	}
+	return b.border
+}
+
+func (b *BaseShape) SetBorder(border *Border) { b.border = border }
+
+func (b *BaseShape) GetShadow() *Shadow {
+	if b.shadow == nil {
+		b.shadow = NewShadow()
+	}
+	return b.shadow
+}
+
+func (b *BaseShape) SetShadow(s *Shadow) { b.shadow = s }
+
+func (b *BaseShape) GetHyperlink() *Hyperlink { return b.hyperlink }
+func (b *BaseShape) SetHyperlink(h *Hyperlink) { b.hyperlink = h }
+
+// RichTextShape represents a rich text shape.
+type RichTextShape struct {
+	BaseShape
+	paragraphs     []*Paragraph
+	activeParagraph int
+	autoFit        AutoFitType
+	wordWrap       bool
+	verticalAlign  VerticalAlignment
+	columns        int
+	columnSpacing  int64
+}
+
+// AutoFitType represents the auto-fit behavior.
+type AutoFitType int
+
+const (
+	AutoFitNone AutoFitType = iota
+	AutoFitNormal
+	AutoFitShape
+)
+
+func (r *RichTextShape) GetType() ShapeType { return ShapeTypeRichText }
+
+// NewRichTextShape creates a new rich text shape.
+func NewRichTextShape() *RichTextShape {
+	rt := &RichTextShape{
+		paragraphs: []*Paragraph{NewParagraph()},
+		wordWrap:   true,
+		columns:    1,
+	}
+	return rt
+}
+
+// SetHeight sets the height and returns the shape for chaining.
+func (r *RichTextShape) SetHeight(h int64) *RichTextShape {
+	r.height = h
+	return r
+}
+
+// SetWidth sets the width and returns the shape for chaining.
+func (r *RichTextShape) SetWidth(w int64) *RichTextShape {
+	r.width = w
+	return r
+}
+
+// SetOffsetX sets the X offset and returns the shape for chaining.
+func (r *RichTextShape) SetOffsetX(x int64) *RichTextShape {
+	r.offsetX = x
+	return r
+}
+
+// SetOffsetY sets the Y offset and returns the shape for chaining.
+func (r *RichTextShape) SetOffsetY(y int64) *RichTextShape {
+	r.offsetY = y
+	return r
+}
+
+// GetActiveParagraph returns the active paragraph.
+func (r *RichTextShape) GetActiveParagraph() *Paragraph {
+	if len(r.paragraphs) == 0 {
+		r.paragraphs = append(r.paragraphs, NewParagraph())
+	}
+	return r.paragraphs[r.activeParagraph]
+}
+
+// CreateParagraph creates a new paragraph and makes it active.
+func (r *RichTextShape) CreateParagraph() *Paragraph {
+	p := NewParagraph()
+	r.paragraphs = append(r.paragraphs, p)
+	r.activeParagraph = len(r.paragraphs) - 1
+	return p
+}
+
+// GetParagraphs returns all paragraphs.
+func (r *RichTextShape) GetParagraphs() []*Paragraph {
+	return r.paragraphs
+}
+
+// CreateTextRun creates a text run in the active paragraph.
+func (r *RichTextShape) CreateTextRun(text string) *TextRun {
+	return r.GetActiveParagraph().CreateTextRun(text)
+}
+
+// CreateBreak creates a line break in the active paragraph.
+func (r *RichTextShape) CreateBreak() *BreakElement {
+	return r.GetActiveParagraph().CreateBreak()
+}
+
+// SetAutoFit sets the auto-fit type.
+func (r *RichTextShape) SetAutoFit(fit AutoFitType) {
+	r.autoFit = fit
+}
+
+// GetAutoFit returns the auto-fit type.
+func (r *RichTextShape) GetAutoFit() AutoFitType {
+	return r.autoFit
+}
+
+// SetWordWrap sets word wrap.
+func (r *RichTextShape) SetWordWrap(wrap bool) {
+	r.wordWrap = wrap
+}
+
+// GetWordWrap returns word wrap setting.
+func (r *RichTextShape) GetWordWrap() bool {
+	return r.wordWrap
+}
+
+// SetColumns sets the number of text columns.
+func (r *RichTextShape) SetColumns(cols int) {
+	r.columns = cols
+}
+
+// GetColumns returns the number of text columns.
+func (r *RichTextShape) GetColumns() int {
+	return r.columns
+}
+
+// Paragraph represents a text paragraph.
+type Paragraph struct {
+	elements    []ParagraphElement
+	alignment   *Alignment
+	bullet      *Bullet
+	lineSpacing int // in points * 100
+	spaceBefore int
+	spaceAfter  int
+}
+
+// ParagraphElement is the interface for paragraph content.
+type ParagraphElement interface {
+	GetElementType() string
+}
+
+// NewParagraph creates a new paragraph.
+func NewParagraph() *Paragraph {
+	return &Paragraph{
+		elements:  make([]ParagraphElement, 0),
+		alignment: NewAlignment(),
+	}
+}
+
+// GetAlignment returns the paragraph alignment.
+func (p *Paragraph) GetAlignment() *Alignment {
+	return p.alignment
+}
+
+// SetAlignment sets the paragraph alignment.
+func (p *Paragraph) SetAlignment(a *Alignment) {
+	p.alignment = a
+}
+
+// GetBullet returns the paragraph bullet.
+func (p *Paragraph) GetBullet() *Bullet {
+	return p.bullet
+}
+
+// SetBullet sets the paragraph bullet.
+func (p *Paragraph) SetBullet(b *Bullet) {
+	p.bullet = b
+}
+
+// GetLineSpacing returns the line spacing.
+func (p *Paragraph) GetLineSpacing() int {
+	return p.lineSpacing
+}
+
+// SetLineSpacing sets the line spacing.
+func (p *Paragraph) SetLineSpacing(spacing int) {
+	p.lineSpacing = spacing
+}
+
+// GetElements returns all paragraph elements.
+func (p *Paragraph) GetElements() []ParagraphElement {
+	return p.elements
+}
+
+// GetSpaceBefore returns the space before the paragraph.
+func (p *Paragraph) GetSpaceBefore() int { return p.spaceBefore }
+
+// SetSpaceBefore sets the space before the paragraph.
+func (p *Paragraph) SetSpaceBefore(v int) { p.spaceBefore = v }
+
+// GetSpaceAfter returns the space after the paragraph.
+func (p *Paragraph) GetSpaceAfter() int { return p.spaceAfter }
+
+// SetSpaceAfter sets the space after the paragraph.
+func (p *Paragraph) SetSpaceAfter(v int) { p.spaceAfter = v }
+
+// CreateTextRun creates a new text run.
+func (p *Paragraph) CreateTextRun(text string) *TextRun {
+	tr := &TextRun{
+		text: text,
+		font: NewFont(),
+	}
+	p.elements = append(p.elements, tr)
+	return tr
+}
+
+// CreateBreak creates a line break element.
+func (p *Paragraph) CreateBreak() *BreakElement {
+	br := &BreakElement{}
+	p.elements = append(p.elements, br)
+	return br
+}
+
+// TextRun represents a run of text with formatting.
+type TextRun struct {
+	text      string
+	font      *Font
+	hyperlink *Hyperlink
+}
+
+func (tr *TextRun) GetElementType() string { return "textrun" }
+
+// GetText returns the text content.
+func (tr *TextRun) GetText() string { return tr.text }
+
+// SetText sets the text content.
+func (tr *TextRun) SetText(text string) { tr.text = text }
+
+// GetFont returns the font properties.
+func (tr *TextRun) GetFont() *Font { return tr.font }
+
+// SetFont sets the font properties.
+func (tr *TextRun) SetFont(f *Font) { tr.font = f }
+
+// GetHyperlink returns the hyperlink.
+func (tr *TextRun) GetHyperlink() *Hyperlink { return tr.hyperlink }
+
+// SetHyperlink sets the hyperlink.
+func (tr *TextRun) SetHyperlink(h *Hyperlink) { tr.hyperlink = h }
+
+// BreakElement represents a line break.
+type BreakElement struct{}
+
+func (br *BreakElement) GetElementType() string { return "break" }
+
+// DrawingShape represents an image/drawing shape.
+type DrawingShape struct {
+	BaseShape
+	path        string // file path
+	data        []byte // raw image data
+	mimeType    string
+	resizeProportional bool
+}
+
+func (d *DrawingShape) GetType() ShapeType { return ShapeTypeDrawing }
+
+// NewDrawingShape creates a new drawing shape.
+func NewDrawingShape() *DrawingShape {
+	return &DrawingShape{
+		resizeProportional: true,
+	}
+}
+
+// SetPath sets the image file path.
+func (d *DrawingShape) SetPath(path string) *DrawingShape {
+	d.path = path
+	return d
+}
+
+// GetPath returns the image file path.
+func (d *DrawingShape) GetPath() string { return d.path }
+
+// SetImageData sets the raw image data.
+func (d *DrawingShape) SetImageData(data []byte, mimeType string) *DrawingShape {
+	d.data = data
+	d.mimeType = mimeType
+	return d
+}
+
+// GetImageData returns the raw image data.
+func (d *DrawingShape) GetImageData() []byte { return d.data }
+
+// GetMimeType returns the image MIME type.
+func (d *DrawingShape) GetMimeType() string { return d.mimeType }
+
+// SetHeight sets the height and returns for chaining.
+func (d *DrawingShape) SetHeight(h int64) *DrawingShape {
+	d.height = h
+	return d
+}
+
+// SetWidth sets the width and returns for chaining.
+func (d *DrawingShape) SetWidth(w int64) *DrawingShape {
+	d.width = w
+	return d
+}
+
+// SetOffsetX sets the X offset and returns for chaining.
+func (d *DrawingShape) SetOffsetX(x int64) *DrawingShape {
+	d.offsetX = x
+	return d
+}
+
+// SetOffsetY sets the Y offset and returns for chaining.
+func (d *DrawingShape) SetOffsetY(y int64) *DrawingShape {
+	d.offsetY = y
+	return d
+}
+
+// AutoShape represents a predefined shape (rectangle, ellipse, etc.).
+type AutoShape struct {
+	BaseShape
+	shapeType AutoShapeType
+	text      string
+}
+
+// AutoShapeType represents the type of auto shape.
+type AutoShapeType string
+
+const (
+	AutoShapeRectangle       AutoShapeType = "rect"
+	AutoShapeRoundedRect     AutoShapeType = "roundRect"
+	AutoShapeEllipse         AutoShapeType = "ellipse"
+	AutoShapeTriangle        AutoShapeType = "triangle"
+	AutoShapeDiamond         AutoShapeType = "diamond"
+	AutoShapeParallelogram   AutoShapeType = "parallelogram"
+	AutoShapeTrapezoid       AutoShapeType = "trapezoid"
+	AutoShapePentagon        AutoShapeType = "pentagon"
+	AutoShapeHexagon         AutoShapeType = "hexagon"
+	AutoShapeArrowRight      AutoShapeType = "rightArrow"
+	AutoShapeArrowLeft       AutoShapeType = "leftArrow"
+	AutoShapeArrowUp         AutoShapeType = "upArrow"
+	AutoShapeArrowDown       AutoShapeType = "downArrow"
+	AutoShapeStar4           AutoShapeType = "star4"
+	AutoShapeStar5           AutoShapeType = "star5"
+	AutoShapeHeart           AutoShapeType = "heart"
+	AutoShapeLightningBolt   AutoShapeType = "lightningBolt"
+)
+
+func (a *AutoShape) GetType() ShapeType { return ShapeTypeAutoShape }
+
+// NewAutoShape creates a new auto shape.
+func NewAutoShape() *AutoShape {
+	return &AutoShape{
+		shapeType: AutoShapeRectangle,
+	}
+}
+
+// SetAutoShapeType sets the auto shape type.
+func (a *AutoShape) SetAutoShapeType(t AutoShapeType) *AutoShape {
+	a.shapeType = t
+	return a
+}
+
+// GetAutoShapeType returns the auto shape type.
+func (a *AutoShape) GetAutoShapeType() AutoShapeType {
+	return a.shapeType
+}
+
+// SetText sets the text content.
+func (a *AutoShape) SetText(text string) *AutoShape {
+	a.text = text
+	return a
+}
+
+// GetText returns the text content.
+func (a *AutoShape) GetText() string {
+	return a.text
+}
+
+// LineShape represents a line shape.
+type LineShape struct {
+	BaseShape
+	lineStyle BorderStyle
+	lineWidth int
+	lineColor Color
+}
+
+func (l *LineShape) GetType() ShapeType { return ShapeTypeLine }
+
+// NewLineShape creates a new line shape.
+func NewLineShape() *LineShape {
+	return &LineShape{
+		lineStyle: BorderSolid,
+		lineWidth: 1,
+		lineColor: ColorBlack,
+	}
+}
+
+// SetLineStyle sets the line style.
+func (l *LineShape) SetLineStyle(s BorderStyle) *LineShape {
+	l.lineStyle = s
+	return l
+}
+
+// GetLineStyle returns the line style.
+func (l *LineShape) GetLineStyle() BorderStyle { return l.lineStyle }
+
+// SetLineWidth sets the line width.
+func (l *LineShape) SetLineWidth(w int) *LineShape {
+	l.lineWidth = w
+	return l
+}
+
+// GetLineWidth returns the line width.
+func (l *LineShape) GetLineWidth() int { return l.lineWidth }
+
+// SetLineColor sets the line color.
+func (l *LineShape) SetLineColor(c Color) *LineShape {
+	l.lineColor = c
+	return l
+}
+
+// GetLineColor returns the line color.
+func (l *LineShape) GetLineColor() Color { return l.lineColor }
+
+// TableShape represents a table shape.
+type TableShape struct {
+	BaseShape
+	rows    [][]*TableCell
+	numRows int
+	numCols int
+}
+
+func (t *TableShape) GetType() ShapeType { return ShapeTypeTable }
+
+// NewTableShape creates a new table shape.
+func NewTableShape(rows, cols int) *TableShape {
+	table := &TableShape{
+		numRows: rows,
+		numCols: cols,
+		rows:    make([][]*TableCell, rows),
+	}
+	for i := 0; i < rows; i++ {
+		table.rows[i] = make([]*TableCell, cols)
+		for j := 0; j < cols; j++ {
+			table.rows[i][j] = NewTableCell()
+		}
+	}
+	return table
+}
+
+// GetCell returns a cell at the given row and column.
+func (t *TableShape) GetCell(row, col int) *TableCell {
+	if row < 0 || row >= t.numRows || col < 0 || col >= t.numCols {
+		return nil
+	}
+	return t.rows[row][col]
+}
+
+// GetRows returns all rows.
+func (t *TableShape) GetRows() [][]*TableCell {
+	return t.rows
+}
+
+// GetNumRows returns the number of rows.
+func (t *TableShape) GetNumRows() int { return t.numRows }
+
+// GetNumCols returns the number of columns.
+func (t *TableShape) GetNumCols() int { return t.numCols }
+
+// SetHeight sets the height and returns for chaining.
+func (t *TableShape) SetHeight(h int64) *TableShape {
+	t.height = h
+	return t
+}
+
+// SetWidth sets the width and returns for chaining.
+func (t *TableShape) SetWidth(w int64) *TableShape {
+	t.width = w
+	return t
+}
+
+// TableCell represents a table cell.
+type TableCell struct {
+	paragraphs []*Paragraph
+	fill       *Fill
+	border     *CellBorders
+	colSpan    int
+	rowSpan    int
+}
+
+// CellBorders represents borders for a table cell.
+type CellBorders struct {
+	Top    *Border
+	Bottom *Border
+	Left   *Border
+	Right  *Border
+}
+
+// NewTableCell creates a new table cell.
+func NewTableCell() *TableCell {
+	return &TableCell{
+		paragraphs: []*Paragraph{NewParagraph()},
+		fill:       NewFill(),
+		border: &CellBorders{
+			Top:    NewBorder(),
+			Bottom: NewBorder(),
+			Left:   NewBorder(),
+			Right:  NewBorder(),
+		},
+		colSpan: 1,
+		rowSpan: 1,
+	}
+}
+
+// SetText sets the cell text (convenience method).
+func (tc *TableCell) SetText(text string) *TableCell {
+	if len(tc.paragraphs) == 0 {
+		tc.paragraphs = append(tc.paragraphs, NewParagraph())
+	}
+	tc.paragraphs[0].CreateTextRun(text)
+	return tc
+}
+
+// GetParagraphs returns the cell paragraphs.
+func (tc *TableCell) GetParagraphs() []*Paragraph {
+	return tc.paragraphs
+}
+
+// GetFill returns the cell fill.
+func (tc *TableCell) GetFill() *Fill { return tc.fill }
+
+// SetFill sets the cell fill.
+func (tc *TableCell) SetFill(f *Fill) { tc.fill = f }
+
+// GetBorders returns the cell borders.
+func (tc *TableCell) GetBorders() *CellBorders { return tc.border }
+
+// SetColSpan sets the column span.
+func (tc *TableCell) SetColSpan(span int) { tc.colSpan = span }
+
+// GetColSpan returns the column span.
+func (tc *TableCell) GetColSpan() int { return tc.colSpan }
+
+// SetRowSpan sets the row span.
+func (tc *TableCell) SetRowSpan(span int) { tc.rowSpan = span }
+
+// GetRowSpan returns the row span.
+func (tc *TableCell) GetRowSpan() int { return tc.rowSpan }
