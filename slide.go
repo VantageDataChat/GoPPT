@@ -127,6 +127,43 @@ func (s *Slide) CreateDrawingShape() *DrawingShape {
 	return shape
 }
 
+// AddImage creates a drawing shape from a file path and adds it to the slide.
+// This is a convenience method matching unioffice's Slide.AddImage pattern.
+func (s *Slide) AddImage(path string) (*DrawingShape, error) {
+	shape := NewDrawingShape()
+	if err := shape.SetImageFromFile(path); err != nil {
+		return nil, err
+	}
+	s.shapes = append(s.shapes, shape)
+	return shape, nil
+}
+
+// AddImageData creates a drawing shape from raw image data and adds it to the slide.
+func (s *Slide) AddImageData(data []byte, mimeType string) *DrawingShape {
+	shape := NewDrawingShape()
+	shape.SetImageData(data, mimeType)
+	s.shapes = append(s.shapes, shape)
+	return shape
+}
+
+// AddTextBox creates a new rich text shape and adds it to the slide.
+// This is an alias for CreateRichTextShape matching unioffice naming.
+func (s *Slide) AddTextBox() *RichTextShape {
+	return s.CreateRichTextShape()
+}
+
+// AddAutoShape creates a new auto shape and adds it to the slide.
+// This matches unioffice's Slide.AddShape pattern.
+func (s *Slide) AddAutoShape() *AutoShape {
+	return s.CreateAutoShape()
+}
+
+// AddTable creates a new table shape and adds it to the slide.
+// This matches unioffice's Slide.AddTable pattern.
+func (s *Slide) AddTable(rows, cols int) *TableShape {
+	return s.CreateTableShape(rows, cols)
+}
+
 // CreateTableShape creates a new table shape and adds it to the slide.
 func (s *Slide) CreateTableShape(rows, cols int) *TableShape {
 	shape := NewTableShape(rows, cols)
@@ -208,4 +245,103 @@ func (s *Slide) SetBackground(f *Fill) {
 // GetBackground returns the slide background fill.
 func (s *Slide) GetBackground() *Fill {
 	return s.background
+}
+
+// --- Placeholder access ---
+
+// GetPlaceholder returns the first placeholder of the given type.
+// Returns nil if no placeholder of that type exists.
+func (s *Slide) GetPlaceholder(phType PlaceholderType) *PlaceholderShape {
+	for _, shape := range s.shapes {
+		if ph, ok := shape.(*PlaceholderShape); ok {
+			if ph.phType == phType {
+				return ph
+			}
+		}
+	}
+	return nil
+}
+
+// GetPlaceholderByIndex returns a placeholder by its index.
+// Returns nil if no placeholder with that index exists.
+func (s *Slide) GetPlaceholderByIndex(idx int) *PlaceholderShape {
+	for _, shape := range s.shapes {
+		if ph, ok := shape.(*PlaceholderShape); ok {
+			if ph.phIdx == idx {
+				return ph
+			}
+		}
+	}
+	return nil
+}
+
+// GetPlaceholders returns all placeholder shapes on the slide.
+func (s *Slide) GetPlaceholders() []*PlaceholderShape {
+	var phs []*PlaceholderShape
+	for _, shape := range s.shapes {
+		if ph, ok := shape.(*PlaceholderShape); ok {
+			phs = append(phs, ph)
+		}
+	}
+	return phs
+}
+
+// GetShapeCount returns the number of shapes on the slide.
+func (s *Slide) GetShapeCount() int {
+	return len(s.shapes)
+}
+
+// ExtractText returns all text content from this slide as a single string.
+func (s *Slide) ExtractText() string {
+	var parts []string
+	for _, shape := range s.shapes {
+		switch sh := shape.(type) {
+		case *RichTextShape:
+			parts = append(parts, extractParagraphsText(sh.paragraphs)...)
+		case *PlaceholderShape:
+			parts = append(parts, extractParagraphsText(sh.paragraphs)...)
+		case *AutoShape:
+			if sh.text != "" {
+				parts = append(parts, sh.text)
+			}
+		case *TableShape:
+			for _, row := range sh.rows {
+				for _, cell := range row {
+					parts = append(parts, extractParagraphsText(cell.paragraphs)...)
+				}
+			}
+		case *GroupShape:
+			for _, gs := range sh.shapes {
+				switch gsh := gs.(type) {
+				case *RichTextShape:
+					parts = append(parts, extractParagraphsText(gsh.paragraphs)...)
+				case *PlaceholderShape:
+					parts = append(parts, extractParagraphsText(gsh.paragraphs)...)
+				}
+			}
+		}
+	}
+	return joinNonEmpty(parts, "\n")
+}
+
+// GetTextBoxes returns all RichTextShape (text box) shapes on the slide.
+func (s *Slide) GetTextBoxes() []*RichTextShape {
+	var boxes []*RichTextShape
+	for _, shape := range s.shapes {
+		if tb, ok := shape.(*RichTextShape); ok {
+			boxes = append(boxes, tb)
+		}
+	}
+	return boxes
+}
+
+// RemoveShapeByPointer removes a specific shape from the slide.
+func (s *Slide) RemoveShapeByPointer(target Shape) bool {
+	for i, shape := range s.shapes {
+		if shape == target {
+			s.shapes = append(s.shapes[:i], s.shapes[i+1:]...)
+			return true
+		}
+	}
+	return false
 }

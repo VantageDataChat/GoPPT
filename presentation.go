@@ -146,8 +146,10 @@ func (p *Presentation) MoveSlide(fromIndex, toIndex int) error {
 	slide := p.slides[fromIndex]
 	// Remove from old position
 	p.slides = append(p.slides[:fromIndex], p.slides[fromIndex+1:]...)
-	// Insert at new position
-	p.slides = append(p.slides[:toIndex], append([]*Slide{slide}, p.slides[toIndex:]...)...)
+	// Insert at new position using copy to avoid intermediate allocation
+	p.slides = append(p.slides, nil) // grow by one
+	copy(p.slides[toIndex+1:], p.slides[toIndex:])
+	p.slides[toIndex] = slide
 	return nil
 }
 

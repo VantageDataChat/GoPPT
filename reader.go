@@ -35,6 +35,15 @@ func NewReader(format ReaderType) (Reader, error) {
 // PPTXReader reads PPTX files.
 type PPTXReader struct{}
 
+// zipIndex builds a map from file name to *zip.File for O(1) lookups.
+func zipIndex(zr *zip.Reader) map[string]*zip.File {
+	m := make(map[string]*zip.File, len(zr.File))
+	for _, f := range zr.File {
+		m[f.Name] = f
+	}
+	return m
+}
+
 // Read reads a presentation from a file path.
 func (r *PPTXReader) Read(path string) (*Presentation, error) {
 	f, err := os.Open(path)
@@ -117,6 +126,7 @@ func (r *PPTXReader) ReadFromReader(reader io.ReaderAt, size int64) (*Presentati
 const maxZipEntrySize = 256 << 20 // 256 MB
 
 func readFileFromZip(zr *zip.Reader, name string) ([]byte, error) {
+	// Build index on first call per reader (callers may also use zipIndex for batch).
 	for _, f := range zr.File {
 		if f.Name == name {
 			if f.UncompressedSize64 > maxZipEntrySize {

@@ -254,6 +254,12 @@ func NewFill() *Fill {
 	return &Fill{Type: FillNone}
 }
 
+// SetNoFill clears the fill.
+func (f *Fill) SetNoFill() *Fill {
+	f.Type = FillNone
+	return f
+}
+
 // SetSolid sets a solid fill.
 func (f *Fill) SetSolid(color Color) *Fill {
 	f.Type = FillSolid
@@ -290,6 +296,25 @@ const (
 // NewBorder creates a new Border with no border.
 func NewBorder() *Border {
 	return &Border{Style: BorderNone}
+}
+
+// SetSolidFill sets a solid border with the given color.
+func (b *Border) SetSolidFill(c Color) *Border {
+	b.Style = BorderSolid
+	b.Color = c
+	return b
+}
+
+// SetWidth sets the border width in EMU.
+func (b *Border) SetWidth(w int) *Border {
+	b.Width = w
+	return b
+}
+
+// SetNoFill removes the border.
+func (b *Border) SetNoFill() *Border {
+	b.Style = BorderNone
+	return b
 }
 
 // Shadow represents a shape shadow.

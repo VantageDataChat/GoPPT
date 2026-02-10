@@ -2,6 +2,7 @@ package gopresentation
 
 import (
 	"archive/zip"
+	"bytes"
 	"encoding/xml"
 	"strconv"
 	"strings"
@@ -14,7 +15,7 @@ func (r *PPTXReader) readSlide(zr *zip.Reader, path string, pres *Presentation) 
 	}
 
 	slide := newSlide()
-	decoder := xml.NewDecoder(strings.NewReader(string(data)))
+	decoder := xml.NewDecoder(bytes.NewReader(data))
 
 	// Read slide relationships for images, charts, comments, notes
 	relsPath := strings.Replace(path, "slides/", "slides/_rels/", 1) + ".rels"
@@ -51,7 +52,7 @@ func (r *PPTXReader) readSlideComments(zr *zip.Reader, slide *Slide, rels []xmlR
 }
 
 func (r *PPTXReader) parseCommentsXML(data []byte, slide *Slide) {
-	decoder := xml.NewDecoder(strings.NewReader(string(data)))
+	decoder := xml.NewDecoder(bytes.NewReader(data))
 	var currentComment *Comment
 	var inText bool
 
@@ -129,7 +130,7 @@ func (r *PPTXReader) readSlideNotes(zr *zip.Reader, slide *Slide, rels []xmlRelF
 }
 
 func (r *PPTXReader) parseNotesXML(data []byte) string {
-	decoder := xml.NewDecoder(strings.NewReader(string(data)))
+	decoder := xml.NewDecoder(bytes.NewReader(data))
 	var inBody bool
 	var inParagraph bool
 	var inRun bool
@@ -201,6 +202,8 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 		inTcText       bool
 		inNvSpPr       bool
 		inSolidFill    bool
+		inSpPr         bool
+		inLn           bool
 		inPPr          bool
 		inBg           bool
 		inBgPr         bool
@@ -227,6 +230,10 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 
 	var offX, offY, extCX, extCY int64
 	var shapeName, shapeDescr string
+	var flipH, flipV bool
+	var shapeRotation int
+	var prstGeom string
+	var textAnchor TextAnchorType
 
 	// Group shape nesting depth
 	grpDepth := 0
@@ -258,6 +265,8 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 						currentGroup = NewGroupShape()
 						offX, offY, extCX, extCY = 0, 0, 0, 0
 						shapeName = ""
+						prstGeom = ""
+						shapeRotation = 0
 					}
 				}
 			case "sp":
@@ -271,6 +280,9 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 					offX, offY, extCX, extCY = 0, 0, 0, 0
 					shapeName = ""
 					shapeDescr = ""
+					prstGeom = ""
+					shapeRotation = 0
+					textAnchor = TextAnchorNone
 				}
 			case "pic":
 				if state.inSpTree || state.inGrpSp {
@@ -279,6 +291,8 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 					offX, offY, extCX, extCY = 0, 0, 0, 0
 					shapeName = ""
 					shapeDescr = ""
+					prstGeom = ""
+					shapeRotation = 0
 				}
 			case "cxnSp":
 				if state.inSpTree || state.inGrpSp {
@@ -286,12 +300,16 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 					currentLine = NewLineShape()
 					offX, offY, extCX, extCY = 0, 0, 0, 0
 					shapeName = ""
+					prstGeom = ""
+					shapeRotation = 0
 				}
 			case "graphicFrame":
 				if state.inSpTree {
 					state.inGraphicFrame = true
 					offX, offY, extCX, extCY = 0, 0, 0, 0
 					shapeName = ""
+					prstGeom = ""
+					shapeRotation = 0
 				}
 			case "tbl":
 				if state.inGraphicFrame {
@@ -366,6 +384,21 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 					}
 				} else if state.inTc {
 					state.inTcTxBody = true
+				}
+			case "bodyPr":
+				if state.inTxBody && !state.isPlaceholder && currentRichText != nil {
+					for _, attr := range t.Attr {
+						switch attr.Name.Local {
+						case "anchor":
+							textAnchor = TextAnchorType(attr.Value)
+						case "wrap":
+							currentRichText.wordWrap = attr.Value == "square"
+						case "numCol":
+							if v, err := strconv.Atoi(attr.Value); err == nil {
+								currentRichText.columns = v
+							}
+						}
+					}
 				}
 			case "p":
 				if state.inTcTxBody {
@@ -499,12 +532,40 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 					state.inSolidFill = true
 				} else if state.inBgPr {
 					state.inBgSolidFill = true
+				} else if state.inSpPr && !state.inTxBody && !state.inLn {
+					// Shape-level solid fill (not inside text body or line)
+					state.inSolidFill = true
+				} else if state.inLn {
+					// Line solid fill
+					state.inSolidFill = true
 				}
 			case "srgbClr":
 				if state.inSolidFill && state.inRunProps && currentFont != nil {
 					for _, attr := range t.Attr {
 						if attr.Name.Local == "val" {
 							currentFont.Color = NewColor("FF" + attr.Value)
+						}
+					}
+				} else if state.inSolidFill && state.inLn && !state.inRunProps {
+					// Line solid fill color (inside <a:ln>)
+					for _, attr := range t.Attr {
+						if attr.Name.Local == "val" {
+							c := NewColor("FF" + attr.Value)
+							if state.inCxnSp && currentLine != nil {
+								currentLine.lineColor = c
+							}
+						}
+					}
+				} else if state.inSolidFill && state.inSpPr && !state.inRunProps && !state.inTxBody && !state.inLn {
+					// Shape-level solid fill color
+					for _, attr := range t.Attr {
+						if attr.Name.Local == "val" {
+							c := NewColor("FF" + attr.Value)
+							if state.inSp {
+								if currentRichText != nil {
+									currentRichText.GetFill().SetSolid(c)
+								}
+							}
 						}
 					}
 				} else if state.inBgSolidFill {
@@ -542,6 +603,23 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 			case "br":
 				if state.inParagraph && currentParagraph != nil {
 					currentParagraph.CreateBreak()
+				}
+			case "xfrm":
+				flipH = false
+				flipV = false
+				shapeRotation = 0
+				for _, attr := range t.Attr {
+					switch attr.Name.Local {
+					case "flipH":
+						flipH = attr.Value == "1" || attr.Value == "true"
+					case "flipV":
+						flipV = attr.Value == "1" || attr.Value == "true"
+					case "rot":
+						// rotation in 60000ths of a degree
+						if v, err := strconv.Atoi(attr.Value); err == nil {
+							shapeRotation = v / 60000
+						}
+					}
 				}
 			case "off":
 				for _, attr := range t.Attr {
@@ -592,6 +670,9 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 					}
 				}
 			case "ln":
+				if state.inSpPr {
+					state.inLn = true
+				}
 				if state.inCxnSp && currentLine != nil {
 					for _, attr := range t.Attr {
 						if attr.Name.Local == "w" {
@@ -599,6 +680,16 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 								currentLine.lineWidth = v / 12700
 							}
 						}
+					}
+				}
+			case "spPr", "grpSpPr":
+				if state.inSp || state.inPic || state.inCxnSp || state.inGrpSp {
+					state.inSpPr = true
+				}
+			case "prstGeom":
+				for _, attr := range t.Attr {
+					if attr.Name.Local == "prst" {
+						prstGeom = attr.Value
 					}
 				}
 			}
@@ -637,6 +728,9 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 							currentGroup.offsetY = offY
 							currentGroup.width = extCX
 							currentGroup.height = extCY
+							currentGroup.flipHorizontal = flipH
+							currentGroup.flipVertical = flipV
+							currentGroup.rotation = shapeRotation
 							slide.shapes = append(slide.shapes, currentGroup)
 						}
 						currentGroup = nil
@@ -652,12 +746,45 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 						currentPlaceholder.offsetY = offY
 						currentPlaceholder.width = extCX
 						currentPlaceholder.height = extCY
+						currentPlaceholder.flipHorizontal = flipH
+						currentPlaceholder.flipVertical = flipV
+						currentPlaceholder.rotation = shapeRotation
 						if state.inGrpSp && currentGroup != nil {
 							currentGroup.AddShape(currentPlaceholder)
 						} else {
 							slide.shapes = append(slide.shapes, currentPlaceholder)
 						}
 						currentPlaceholder = nil
+					} else if prstGeom != "" && prstGeom != "rect" {
+						// Non-rect geometry → AutoShape
+						autoShape := NewAutoShape()
+						autoShape.name = shapeName
+						autoShape.description = shapeDescr
+						autoShape.offsetX = offX
+						autoShape.offsetY = offY
+						autoShape.width = extCX
+						autoShape.height = extCY
+						autoShape.flipHorizontal = flipH
+						autoShape.flipVertical = flipV
+						autoShape.rotation = shapeRotation
+						autoShape.shapeType = AutoShapeType(prstGeom)
+						// Copy text from richtext if any
+						if currentRichText != nil && len(currentRichText.paragraphs) > 0 {
+							var texts []string
+							for _, para := range currentRichText.paragraphs {
+								for _, elem := range para.elements {
+									if tr, ok := elem.(*TextRun); ok {
+										texts = append(texts, tr.text)
+									}
+								}
+							}
+							autoShape.text = joinNonEmpty(texts, "")
+						}
+						if state.inGrpSp && currentGroup != nil {
+							currentGroup.AddShape(autoShape)
+						} else {
+							slide.shapes = append(slide.shapes, autoShape)
+						}
 					} else if currentRichText != nil {
 						currentRichText.name = shapeName
 						currentRichText.description = shapeDescr
@@ -665,6 +792,10 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 						currentRichText.offsetY = offY
 						currentRichText.width = extCX
 						currentRichText.height = extCY
+						currentRichText.flipHorizontal = flipH
+						currentRichText.flipVertical = flipV
+						currentRichText.rotation = shapeRotation
+						currentRichText.textAnchor = textAnchor
 						if state.inGrpSp && currentGroup != nil {
 							currentGroup.AddShape(currentRichText)
 						} else {
@@ -684,6 +815,9 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 						currentDrawing.offsetY = offY
 						currentDrawing.width = extCX
 						currentDrawing.height = extCY
+						currentDrawing.flipHorizontal = flipH
+						currentDrawing.flipVertical = flipV
+						currentDrawing.rotation = shapeRotation
 						if state.inGrpSp && currentGroup != nil {
 							currentGroup.AddShape(currentDrawing)
 						} else {
@@ -701,6 +835,9 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 						currentLine.offsetY = offY
 						currentLine.width = extCX
 						currentLine.height = extCY
+						currentLine.flipHorizontal = flipH
+						currentLine.flipVertical = flipV
+						currentLine.rotation = shapeRotation
 						if state.inGrpSp && currentGroup != nil {
 							currentGroup.AddShape(currentLine)
 						} else {
@@ -757,6 +894,11 @@ func (r *PPTXReader) parseSlideXML(decoder *xml.Decoder, slide *Slide, rels []xm
 			case "solidFill":
 				state.inSolidFill = false
 				state.inBgSolidFill = false
+			case "spPr", "grpSpPr":
+				state.inSpPr = false
+				state.inLn = false
+			case "ln":
+				state.inLn = false
 			case "buClr":
 				state.inBuClr = false
 			case "t":

@@ -13,21 +13,12 @@ func (w *PPTXWriter) buildHyperlinkRelMap(slide *Slide) map[*TextRun]string {
 	m := make(map[*TextRun]string)
 	relIdx := 2 // rId1 is slideLayout
 	for _, shape := range slide.shapes {
-		switch s := shape.(type) {
-		case *DrawingShape:
-			if s.data != nil || s.path != "" {
-				relIdx++
-			}
-		case *ChartShape:
-			relIdx++
-		}
-		if bs, ok := shape.(*RichTextShape); ok {
-			for _, para := range bs.paragraphs {
-				for _, elem := range para.elements {
-					if tr, ok := elem.(*TextRun); ok && tr.hyperlink != nil && !tr.hyperlink.IsInternal {
-						m[tr] = fmt.Sprintf("rId%d", relIdx)
-						relIdx++
-					}
+		relIdx += countShapeRels(shape)
+		for _, para := range shapeParagraphs(shape) {
+			for _, elem := range para.elements {
+				if tr, ok := elem.(*TextRun); ok && tr.hyperlink != nil && !tr.hyperlink.IsInternal {
+					m[tr] = fmt.Sprintf("rId%d", relIdx)
+					relIdx++
 				}
 			}
 		}
@@ -35,9 +26,52 @@ func (w *PPTXWriter) buildHyperlinkRelMap(slide *Slide) map[*TextRun]string {
 	return m
 }
 
-func (w *PPTXWriter) writeSlide(zw *zip.Writer, slide *Slide, slideNum int) error {
-	// Pre-compute hyperlink relationship IDs so the XML references match the .rels file.
-	hlinkRelMap := w.buildHyperlinkRelMap(slide)
+// countShapeRels returns the number of non-hyperlink relationship IDs consumed by a shape
+// (images and charts each consume one relId).
+func countShapeRels(shape Shape) int {
+	switch s := shape.(type) {
+	case *DrawingShape:
+		if s.data != nil || s.path != "" {
+			return 1
+		}
+	case *ChartShape:
+		return 1
+	}
+	return 0
+}
+
+// shapeParagraphs returns the paragraphs for shapes that can contain hyperlinks.
+func shapeParagraphs(shape Shape) []*Paragraph {
+	switch s := shape.(type) {
+	case *RichTextShape:
+		return s.paragraphs
+	case *PlaceholderShape:
+		return s.paragraphs
+	}
+	return nil
+}
+
+// countRelIdxBefore computes the relIdx for a target shape within a slide,
+// counting all rels (images, charts, hyperlinks) for shapes before it.
+func countRelIdxBefore(shapes []Shape, target Shape) int {
+	relIdx := 2 // rId1 is slideLayout
+	for _, shape := range shapes {
+		if shape == target {
+			break
+		}
+		relIdx += countShapeRels(shape)
+		for _, para := range shapeParagraphs(shape) {
+			for _, elem := range para.elements {
+				if tr, ok := elem.(*TextRun); ok && tr.hyperlink != nil && !tr.hyperlink.IsInternal {
+					relIdx++
+				}
+			}
+		}
+	}
+	return relIdx
+}
+
+func (w *PPTXWriter) writeSlide(zw *zip.Writer, slide *Slide, slideNum int, hlinkRelMap map[*TextRun]string) error {
 
 	var shapesXML strings.Builder
 	shapeID := 2 // 1 is reserved for the group shape
@@ -105,10 +139,9 @@ func (w *PPTXWriter) writeSlide(zw *zip.Writer, slide *Slide, slideNum int) erro
 	return writeRawXMLToZip(zw, fmt.Sprintf("ppt/slides/slide%d.xml", slideNum), content)
 }
 
-func (w *PPTXWriter) writeSlideRels(zw *zip.Writer, slide *Slide, slideNum int) error {
-	hlinkRelMap := w.buildHyperlinkRelMap(slide)
-
-	rels := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+func (w *PPTXWriter) writeSlideRels(zw *zip.Writer, slide *Slide, slideNum int, hlinkRelMap map[*TextRun]string) error {
+	var rels strings.Builder
+	fmt.Fprintf(&rels, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="%s">
   <Relationship Id="rId1" Type="%s" Target="../slideLayouts/slideLayout1.xml"/>`, nsRelationships, relTypeSlideLayout)
 
@@ -119,30 +152,35 @@ func (w *PPTXWriter) writeSlideRels(zw *zip.Writer, slide *Slide, slideNum int) 
 			if s.data != nil || s.path != "" {
 				imgIdx := w.getImageIndex(slide, s)
 				ext := w.getImageExtension(s)
-				rels += fmt.Sprintf(`
+				fmt.Fprintf(&rels, `
   <Relationship Id="rId%d" Type="%s" Target="../media/image%d.%s"/>`,
 					relIdx, relTypeImage, imgIdx, ext)
 				relIdx++
 			}
 		case *ChartShape:
 			chartIdx := w.getChartIndex(s)
-			rels += fmt.Sprintf(`
+			fmt.Fprintf(&rels, `
   <Relationship Id="rId%d" Type="%s" Target="../charts/chart%d.xml"/>`,
 				relIdx, relTypeChart, chartIdx)
 			relIdx++
 		}
-		// Handle hyperlinks in shapes
-		if bs, ok := shape.(*RichTextShape); ok {
-			for _, para := range bs.paragraphs {
-				for _, elem := range para.elements {
-					if tr, ok := elem.(*TextRun); ok && tr.hyperlink != nil {
-						if !tr.hyperlink.IsInternal {
-							rid := hlinkRelMap[tr]
-							rels += fmt.Sprintf(`
+		// Handle hyperlinks in shapes with paragraphs
+		var paras []*Paragraph
+		switch s := shape.(type) {
+		case *RichTextShape:
+			paras = s.paragraphs
+		case *PlaceholderShape:
+			paras = s.paragraphs
+		}
+		for _, para := range paras {
+			for _, elem := range para.elements {
+				if tr, ok := elem.(*TextRun); ok && tr.hyperlink != nil {
+					if !tr.hyperlink.IsInternal {
+						rid := hlinkRelMap[tr]
+						fmt.Fprintf(&rels, `
   <Relationship Id="%s" Type="%s" Target="%s" TargetMode="External"/>`,
-								rid, relTypeHyperlink, xmlEscape(tr.hyperlink.URL))
-							relIdx++
-						}
+							rid, relTypeHyperlink, xmlEscape(tr.hyperlink.URL))
+						relIdx++
 					}
 				}
 			}
@@ -151,7 +189,7 @@ func (w *PPTXWriter) writeSlideRels(zw *zip.Writer, slide *Slide, slideNum int) 
 
 	// Comments relationship
 	if len(slide.comments) > 0 {
-		rels += fmt.Sprintf(`
+		fmt.Fprintf(&rels, `
   <Relationship Id="rId%d" Type="%s" Target="../comments/comment%d.xml"/>`,
 			relIdx, relTypeComment, slideNum)
 		relIdx++
@@ -159,35 +197,63 @@ func (w *PPTXWriter) writeSlideRels(zw *zip.Writer, slide *Slide, slideNum int) 
 
 	// Notes slide relationship
 	if slide.notes != "" {
-		rels += fmt.Sprintf(`
+		fmt.Fprintf(&rels, `
   <Relationship Id="rId%d" Type="%s" Target="../notesSlides/notesSlide%d.xml"/>`,
 			relIdx, relTypeNotesSlide, slideNum)
 		relIdx++
 	}
 
-	rels += `
-</Relationships>`
-	return writeRawXMLToZip(zw, fmt.Sprintf("ppt/slides/_rels/slide%d.xml.rels", slideNum), rels)
+	rels.WriteString(`
+</Relationships>`)
+	return writeRawXMLToZip(zw, fmt.Sprintf("ppt/slides/_rels/slide%d.xml.rels", slideNum), rels.String())
 }
 
 func (w *PPTXWriter) getImageIndex(slide *Slide, target *DrawingShape) int {
 	idx := 1
 	for _, sl := range w.presentation.slides {
-		for _, shape := range sl.shapes {
-			if ds, ok := shape.(*DrawingShape); ok {
-				if ds.data != nil || ds.path != "" {
-					if ds == target {
-						return idx
-					}
-					idx++
-				}
+		for _, ds := range collectDrawingShapes(sl.shapes) {
+			if ds == target {
+				return idx
 			}
+			idx++
 		}
 	}
 	return idx
 }
 
+// collectDrawingShapes returns all DrawingShapes from a shape list,
+// including those nested inside GroupShapes (recursively).
+func collectDrawingShapes(shapes []Shape) []*DrawingShape {
+	var result []*DrawingShape
+	for _, shape := range shapes {
+		switch s := shape.(type) {
+		case *DrawingShape:
+			if s.data != nil || s.path != "" {
+				result = append(result, s)
+			}
+		case *GroupShape:
+			result = append(result, collectDrawingShapes(s.shapes)...)
+		}
+	}
+	return result
+}
+
 // --- Rich Text Shape XML ---
+
+// xfrmAttrs builds the attribute string for <a:xfrm> including rotation and flip.
+func xfrmAttrs(b *BaseShape) string {
+	var sb strings.Builder
+	if b.rotation != 0 {
+		fmt.Fprintf(&sb, ` rot="%d"`, b.rotation*60000)
+	}
+	if b.flipHorizontal {
+		sb.WriteString(` flipH="1"`)
+	}
+	if b.flipVertical {
+		sb.WriteString(` flipV="1"`)
+	}
+	return sb.String()
+}
 
 func (w *PPTXWriter) writeRichTextShapeXML(s *RichTextShape, shapeID *int) string {
 	id := *shapeID
@@ -198,10 +264,7 @@ func (w *PPTXWriter) writeRichTextShapeXML(s *RichTextShape, shapeID *int) strin
 		name = fmt.Sprintf("TextBox %d", id)
 	}
 
-	rotation := ""
-	if s.rotation != 0 {
-		rotation = fmt.Sprintf(` rot="%d"`, s.rotation*60000)
-	}
+	xfAttrs := xfrmAttrs(&s.BaseShape)
 
 	fillXML := w.writeFillXML(s.GetFill())
 	borderXML := w.writeBorderXML(s.GetBorder())
@@ -211,9 +274,14 @@ func (w *PPTXWriter) writeRichTextShapeXML(s *RichTextShape, shapeID *int) strin
 		paragraphsXML.WriteString(w.writeParagraphXML(para))
 	}
 
+	descrAttr := ""
+	if s.description != "" {
+		descrAttr = fmt.Sprintf(` descr="%s"`, xmlEscape(s.description))
+	}
+
 	return fmt.Sprintf(`      <p:sp>
         <p:nvSpPr>
-          <p:cNvPr id="%d" name="%s"/>
+          <p:cNvPr id="%d" name="%s"%s/>
           <p:cNvSpPr txBox="1"/>
           <p:nvPr/>
         </p:nvSpPr>
@@ -227,14 +295,14 @@ func (w *PPTXWriter) writeRichTextShapeXML(s *RichTextShape, shapeID *int) strin
           </a:prstGeom>
 %s%s        </p:spPr>
         <p:txBody>
-          <a:bodyPr wrap="%s" numCol="%d"/>
+          <a:bodyPr wrap="%s" numCol="%d"%s/>
           <a:lstStyle/>
 %s        </p:txBody>
       </p:sp>
-`, id, xmlEscape(name), rotation,
+`, id, xmlEscape(name), descrAttr, xfAttrs,
 		s.offsetX, s.offsetY, s.width, s.height,
 		fillXML, borderXML,
-		boolToWrap(s.wordWrap), s.columns,
+		boolToWrap(s.wordWrap), s.columns, textAnchorAttr(s.textAnchor),
 		paragraphsXML.String())
 }
 
@@ -243,6 +311,14 @@ func boolToWrap(wrap bool) string {
 		return "square"
 	}
 	return "none"
+}
+
+// textAnchorAttr returns the anchor attribute string for <a:bodyPr>.
+func textAnchorAttr(anchor TextAnchorType) string {
+	if anchor == "" || anchor == TextAnchorNone {
+		return ""
+	}
+	return fmt.Sprintf(` anchor="%s"`, string(anchor))
 }
 
 func (w *PPTXWriter) writeParagraphXML(para *Paragraph) string {
@@ -349,20 +425,10 @@ func (w *PPTXWriter) writeDrawingShapeXML(s *DrawingShape, shapeID *int, slideNu
 		name = fmt.Sprintf("Picture %d", id)
 	}
 
-	// Find the relationship ID for this image within the current slide
-	relIdx := 2 // rId1 is slideLayout
+	// Find the relationship ID for this image within the current slide.
+	// Must match the ordering in writeSlideRels exactly.
 	currentSlide := w.presentation.slides[slideNum-1]
-	for _, shape := range currentSlide.shapes {
-		if ds, ok := shape.(*DrawingShape); ok && (ds.data != nil || ds.path != "") {
-			if ds == s {
-				break
-			}
-			relIdx++
-		}
-		if _, ok := shape.(*ChartShape); ok {
-			relIdx++
-		}
-	}
+	relIdx := countRelIdxBefore(currentSlide.shapes, s)
 
 	shadowXML := ""
 	if s.shadow != nil && s.shadow.Visible {
@@ -396,7 +462,7 @@ func (w *PPTXWriter) writeDrawingShapeXML(s *DrawingShape, shapeID *int, slideNu
           </a:stretch>
         </p:blipFill>
         <p:spPr>
-          <a:xfrm>
+          <a:xfrm%s>
             <a:off x="%d" y="%d"/>
             <a:ext cx="%d" cy="%d"/>
           </a:xfrm>
@@ -407,6 +473,7 @@ func (w *PPTXWriter) writeDrawingShapeXML(s *DrawingShape, shapeID *int, slideNu
       </p:pic>
 `, id, xmlEscape(name), xmlEscape(s.description),
 		relIdx,
+		xfrmAttrs(&s.BaseShape),
 		s.offsetX, s.offsetY, s.width, s.height,
 		shadowXML)
 }
@@ -440,14 +507,19 @@ func (w *PPTXWriter) writeAutoShapeXML(s *AutoShape, shapeID *int) string {
         </p:txBody>`, xmlEscape(s.text))
 	}
 
+	descrAttr := ""
+	if s.description != "" {
+		descrAttr = fmt.Sprintf(` descr="%s"`, xmlEscape(s.description))
+	}
+
 	return fmt.Sprintf(`      <p:sp>
         <p:nvSpPr>
-          <p:cNvPr id="%d" name="%s"/>
+          <p:cNvPr id="%d" name="%s"%s/>
           <p:cNvSpPr/>
           <p:nvPr/>
         </p:nvSpPr>
         <p:spPr>
-          <a:xfrm>
+          <a:xfrm%s>
             <a:off x="%d" y="%d"/>
             <a:ext cx="%d" cy="%d"/>
           </a:xfrm>
@@ -456,7 +528,8 @@ func (w *PPTXWriter) writeAutoShapeXML(s *AutoShape, shapeID *int) string {
           </a:prstGeom>
 %s%s        </p:spPr>%s
       </p:sp>
-`, id, xmlEscape(name),
+`, id, xmlEscape(name), descrAttr,
+		xfrmAttrs(&s.BaseShape),
 		s.offsetX, s.offsetY, s.width, s.height,
 		s.shapeType,
 		fillXML, borderXML, textXML)
@@ -480,7 +553,7 @@ func (w *PPTXWriter) writeLineShapeXML(s *LineShape, shapeID *int) string {
           <p:nvPr/>
         </p:nvCxnSpPr>
         <p:spPr>
-          <a:xfrm>
+          <a:xfrm%s>
             <a:off x="%d" y="%d"/>
             <a:ext cx="%d" cy="%d"/>
           </a:xfrm>
@@ -495,6 +568,7 @@ func (w *PPTXWriter) writeLineShapeXML(s *LineShape, shapeID *int) string {
         </p:spPr>
       </p:cxnSp>
 `, id, xmlEscape(name),
+		xfrmAttrs(&s.BaseShape),
 		s.offsetX, s.offsetY, s.width, s.height,
 		int64(s.lineWidth)*12700,
 		s.lineColor.ARGB[2:])
@@ -630,33 +704,31 @@ func (w *PPTXWriter) writeBorderXML(b *Border) string {
 func (w *PPTXWriter) writeMedia(zw *zip.Writer) error {
 	imgIdx := 1
 	for _, slide := range w.presentation.slides {
-		for _, shape := range slide.shapes {
-			if ds, ok := shape.(*DrawingShape); ok {
-				if ds.data != nil {
-					ext := w.getImageExtension(ds)
-					fw, err := zw.Create(fmt.Sprintf("ppt/media/image%d.%s", imgIdx, ext))
-					if err != nil {
-						return err
-					}
-					if _, err := fw.Write(ds.data); err != nil {
-						return err
-					}
-					imgIdx++
-				} else if ds.path != "" {
-					data, err := os.ReadFile(ds.path)
-					if err != nil {
-						return fmt.Errorf("failed to read image %s: %w", ds.path, err)
-					}
-					ext := w.getImageExtension(ds)
-					fw, err := zw.Create(fmt.Sprintf("ppt/media/image%d.%s", imgIdx, ext))
-					if err != nil {
-						return err
-					}
-					if _, err := fw.Write(data); err != nil {
-						return err
-					}
-					imgIdx++
+		for _, ds := range collectDrawingShapes(slide.shapes) {
+			if ds.data != nil {
+				ext := w.getImageExtension(ds)
+				fw, err := zw.Create(fmt.Sprintf("ppt/media/image%d.%s", imgIdx, ext))
+				if err != nil {
+					return err
 				}
+				if _, err := fw.Write(ds.data); err != nil {
+					return err
+				}
+				imgIdx++
+			} else if ds.path != "" {
+				data, err := os.ReadFile(ds.path)
+				if err != nil {
+					return fmt.Errorf("failed to read image %s: %w", ds.path, err)
+				}
+				ext := w.getImageExtension(ds)
+				fw, err := zw.Create(fmt.Sprintf("ppt/media/image%d.%s", imgIdx, ext))
+				if err != nil {
+					return err
+				}
+				if _, err := fw.Write(data); err != nil {
+					return err
+				}
+				imgIdx++
 			}
 		}
 	}
@@ -689,19 +761,8 @@ func (w *PPTXWriter) writeChartShapeXML(s *ChartShape, shapeID *int, slideNum in
 		name = fmt.Sprintf("Chart %d", id)
 	}
 
-	// Find chart rel ID
-	relIdx := 2 // rId1 is slideLayout
-	for _, shape := range w.presentation.slides[slideNum-1].shapes {
-		if ds, ok := shape.(*DrawingShape); ok && (ds.data != nil || ds.path != "") {
-			relIdx++
-		}
-		if shape == s {
-			break
-		}
-		if _, ok := shape.(*ChartShape); ok {
-			relIdx++
-		}
-	}
+	// Find chart rel ID — must match ordering in writeSlideRels exactly.
+	relIdx := countRelIdxBefore(w.presentation.slides[slideNum-1].shapes, s)
 
 	return fmt.Sprintf(`      <p:graphicFrame>
         <p:nvGraphicFramePr>
@@ -740,6 +801,8 @@ func (w *PPTXWriter) writeGroupShapeXML(g *GroupShape, shapeID *int, slideNum in
 	var childXML strings.Builder
 	for _, shape := range g.shapes {
 		switch s := shape.(type) {
+		case *PlaceholderShape:
+			childXML.WriteString(w.writePlaceholderShapeXML(s, shapeID))
 		case *RichTextShape:
 			childXML.WriteString(w.writeRichTextShapeXML(s, shapeID))
 		case *AutoShape:
@@ -748,6 +811,8 @@ func (w *PPTXWriter) writeGroupShapeXML(g *GroupShape, shapeID *int, slideNum in
 			childXML.WriteString(w.writeLineShapeXML(s, shapeID))
 		case *DrawingShape:
 			childXML.WriteString(w.writeDrawingShapeXML(s, shapeID, slideNum))
+		case *TableShape:
+			childXML.WriteString(w.writeTableShapeXML(s, shapeID))
 		}
 	}
 
@@ -758,7 +823,7 @@ func (w *PPTXWriter) writeGroupShapeXML(g *GroupShape, shapeID *int, slideNum in
           <p:nvPr/>
         </p:nvGrpSpPr>
         <p:grpSpPr>
-          <a:xfrm>
+          <a:xfrm%s>
             <a:off x="%d" y="%d"/>
             <a:ext cx="%d" cy="%d"/>
             <a:chOff x="%d" y="%d"/>
@@ -767,6 +832,7 @@ func (w *PPTXWriter) writeGroupShapeXML(g *GroupShape, shapeID *int, slideNum in
         </p:grpSpPr>
 %s      </p:grpSp>
 `, id, xmlEscape(name),
+		xfrmAttrs(&g.BaseShape),
 		g.offsetX, g.offsetY, g.width, g.height,
 		g.offsetX, g.offsetY, g.width, g.height,
 		childXML.String())
@@ -799,7 +865,7 @@ func (w *PPTXWriter) writePlaceholderShapeXML(s *PlaceholderShape, shapeID *int)
           </p:nvPr>
         </p:nvSpPr>
         <p:spPr>
-          <a:xfrm>
+          <a:xfrm%s>
             <a:off x="%d" y="%d"/>
             <a:ext cx="%d" cy="%d"/>
           </a:xfrm>
@@ -811,6 +877,7 @@ func (w *PPTXWriter) writePlaceholderShapeXML(s *PlaceholderShape, shapeID *int)
       </p:sp>
 `, id, xmlEscape(name),
 		s.phType, s.phIdx,
+		xfrmAttrs(&s.BaseShape),
 		s.offsetX, s.offsetY, s.width, s.height,
 		paragraphsXML.String())
 }

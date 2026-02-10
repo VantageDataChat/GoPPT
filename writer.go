@@ -131,10 +131,11 @@ func (w *PPTXWriter) WriteTo(writer io.Writer) error {
 
 	// Write slides
 	for i, slide := range w.presentation.slides {
-		if err := w.writeSlide(zw, slide, i+1); err != nil {
+		hlinkRelMap := w.buildHyperlinkRelMap(slide)
+		if err := w.writeSlide(zw, slide, i+1, hlinkRelMap); err != nil {
 			return err
 		}
-		if err := w.writeSlideRels(zw, slide, i+1); err != nil {
+		if err := w.writeSlideRels(zw, slide, i+1, hlinkRelMap); err != nil {
 			return err
 		}
 	}

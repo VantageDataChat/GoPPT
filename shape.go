@@ -1,5 +1,11 @@
 package gopresentation
 
+import (
+	"fmt"
+	"os"
+	"strings"
+)
+
 // Shape is the interface that all shapes implement.
 type Shape interface {
 	GetType() ShapeType
@@ -25,17 +31,19 @@ const (
 
 // BaseShape contains common shape properties.
 type BaseShape struct {
-	name        string
-	description string
-	offsetX     int64 // in EMU
-	offsetY     int64 // in EMU
-	width       int64 // in EMU
-	height      int64 // in EMU
-	rotation    int   // in degrees
-	fill        *Fill
-	border      *Border
-	shadow      *Shadow
-	hyperlink   *Hyperlink
+	name           string
+	description    string
+	offsetX        int64 // in EMU
+	offsetY        int64 // in EMU
+	width          int64 // in EMU
+	height         int64 // in EMU
+	rotation       int   // in degrees
+	flipHorizontal bool
+	flipVertical   bool
+	fill           *Fill
+	border         *Border
+	shadow         *Shadow
+	hyperlink      *Hyperlink
 }
 
 func (b *BaseShape) GetOffsetX() int64   { return b.offsetX }
@@ -51,6 +59,38 @@ func (b *BaseShape) SetWidth(w int64) *BaseShape     { b.width = w; return b }
 func (b *BaseShape) SetHeight(h int64) *BaseShape    { b.height = h; return b }
 func (b *BaseShape) SetName(n string) *BaseShape     { b.name = n; return b }
 func (b *BaseShape) SetRotation(r int) *BaseShape    { b.rotation = ((r % 360) + 360) % 360; return b }
+
+// SetPosition sets both offset X and Y in EMU.
+func (b *BaseShape) SetPosition(x, y int64) *BaseShape {
+	b.offsetX = x
+	b.offsetY = y
+	return b
+}
+
+// SetSize sets both width and height in EMU.
+func (b *BaseShape) SetSize(w, h int64) *BaseShape {
+	b.width = w
+	b.height = h
+	return b
+}
+
+// SetFlipHorizontal controls horizontal flipping.
+func (b *BaseShape) SetFlipHorizontal(flip bool) *BaseShape {
+	b.flipHorizontal = flip
+	return b
+}
+
+// GetFlipHorizontal returns whether the shape is flipped horizontally.
+func (b *BaseShape) GetFlipHorizontal() bool { return b.flipHorizontal }
+
+// SetFlipVertical controls vertical flipping.
+func (b *BaseShape) SetFlipVertical(flip bool) *BaseShape {
+	b.flipVertical = flip
+	return b
+}
+
+// GetFlipVertical returns whether the shape is flipped vertically.
+func (b *BaseShape) GetFlipVertical() bool { return b.flipVertical }
 
 func (b *BaseShape) GetDescription() string          { return b.description }
 func (b *BaseShape) SetDescription(d string)         { b.description = d }
@@ -93,9 +133,20 @@ type RichTextShape struct {
 	autoFit        AutoFitType
 	wordWrap       bool
 	verticalAlign  VerticalAlignment
+	textAnchor     TextAnchorType
 	columns        int
 	columnSpacing  int64
 }
+
+// TextAnchorType represents the text anchoring type within a shape.
+type TextAnchorType string
+
+const (
+	TextAnchorTop    TextAnchorType = "t"
+	TextAnchorMiddle TextAnchorType = "ctr"
+	TextAnchorBottom TextAnchorType = "b"
+	TextAnchorNone   TextAnchorType = ""
+)
 
 // AutoFitType represents the auto-fit behavior.
 type AutoFitType int
@@ -201,6 +252,16 @@ func (r *RichTextShape) SetColumns(cols int) {
 // GetColumns returns the number of text columns.
 func (r *RichTextShape) GetColumns() int {
 	return r.columns
+}
+
+// SetTextAnchor sets the text anchoring type (vertical position of text within the shape).
+func (r *RichTextShape) SetTextAnchor(anchor TextAnchorType) {
+	r.textAnchor = anchor
+}
+
+// GetTextAnchor returns the text anchoring type.
+func (r *RichTextShape) GetTextAnchor() TextAnchorType {
+	return r.textAnchor
 }
 
 // Paragraph represents a text paragraph.
@@ -362,6 +423,37 @@ func (d *DrawingShape) GetImageData() []byte { return d.data }
 // GetMimeType returns the image MIME type.
 func (d *DrawingShape) GetMimeType() string { return d.mimeType }
 
+// SetImageFromFile loads an image from a file path and sets the data and MIME type.
+func (d *DrawingShape) SetImageFromFile(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read image file: %w", err)
+	}
+	mime := guessMimeFromPath(path)
+	d.data = data
+	d.mimeType = mime
+	return nil
+}
+
+// guessMimeFromPath guesses the MIME type from a file extension.
+func guessMimeFromPath(path string) string {
+	lower := strings.ToLower(path)
+	switch {
+	case strings.HasSuffix(lower, ".png"):
+		return "image/png"
+	case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
+		return "image/jpeg"
+	case strings.HasSuffix(lower, ".gif"):
+		return "image/gif"
+	case strings.HasSuffix(lower, ".bmp"):
+		return "image/bmp"
+	case strings.HasSuffix(lower, ".svg"):
+		return "image/svg+xml"
+	default:
+		return "image/png"
+	}
+}
+
 // SetHeight sets the height and returns for chaining.
 func (d *DrawingShape) SetHeight(h int64) *DrawingShape {
 	d.height = h
@@ -412,8 +504,32 @@ const (
 	AutoShapeArrowDown       AutoShapeType = "downArrow"
 	AutoShapeStar4           AutoShapeType = "star4"
 	AutoShapeStar5           AutoShapeType = "star5"
+	AutoShapeStar10          AutoShapeType = "star10"
+	AutoShapeStar12          AutoShapeType = "star12"
+	AutoShapeStar16          AutoShapeType = "star16"
+	AutoShapeStar24          AutoShapeType = "star24"
+	AutoShapeStar32          AutoShapeType = "star32"
 	AutoShapeHeart           AutoShapeType = "heart"
 	AutoShapeLightningBolt   AutoShapeType = "lightningBolt"
+	AutoShapeChevron         AutoShapeType = "chevron"
+	AutoShapeCloud           AutoShapeType = "cloud"
+	AutoShapePlus            AutoShapeType = "mathPlus"
+	AutoShapeMinus           AutoShapeType = "mathMinus"
+	AutoShapeFlowchartProcess AutoShapeType = "flowChartProcess"
+	AutoShapeFlowchartDecision AutoShapeType = "flowChartDecision"
+	AutoShapeCallout1        AutoShapeType = "wedgeRoundRectCallout"
+	AutoShapeCallout2        AutoShapeType = "wedgeEllipseCallout"
+	AutoShapeRibbon          AutoShapeType = "ribbon2"
+	AutoShapeSmileyFace      AutoShapeType = "smileyFace"
+	AutoShapeDonut           AutoShapeType = "donut"
+	AutoShapeNoSmoking       AutoShapeType = "noSmoking"
+	AutoShapeBlockArc        AutoShapeType = "blockArc"
+	AutoShapeCube            AutoShapeType = "cube"
+	AutoShapeCan             AutoShapeType = "can"
+	AutoShapeBevel           AutoShapeType = "bevel"
+	AutoShapeFoldedCorner    AutoShapeType = "foldedCorner"
+	AutoShapeFrame           AutoShapeType = "frame"
+	AutoShapePlaque          AutoShapeType = "plaque"
 )
 
 func (a *AutoShape) GetType() ShapeType { return ShapeTypeAutoShape }
@@ -431,9 +547,22 @@ func (a *AutoShape) SetAutoShapeType(t AutoShapeType) *AutoShape {
 	return a
 }
 
+// SetGeometry sets the shape geometry type (alias for SetAutoShapeType).
+// This matches the unioffice naming convention.
+func (a *AutoShape) SetGeometry(t AutoShapeType) *AutoShape {
+	a.shapeType = t
+	return a
+}
+
 // GetAutoShapeType returns the auto shape type.
 func (a *AutoShape) GetAutoShapeType() AutoShapeType {
 	return a.shapeType
+}
+
+// SetSolidFill sets a solid fill on the auto shape.
+func (a *AutoShape) SetSolidFill(c Color) *AutoShape {
+	a.GetFill().SetSolid(c)
+	return a
 }
 
 // SetText sets the text content.

@@ -130,31 +130,24 @@ func (w *PPTXWriter) writeContentTypes(zw *zip.Writer) error {
 	}
 
 	// Add image defaults
-	hasImages := false
 	for _, slide := range w.presentation.slides {
-		for _, shape := range slide.shapes {
-			if ds, ok := shape.(*DrawingShape); ok {
-				if ds.data != nil || ds.path != "" {
-					hasImages = true
-					ext := w.getImageExtension(ds)
-					found := false
-					for _, d := range ct.Defaults {
-						if d.Extension == ext {
-							found = true
-							break
-						}
-					}
-					if !found {
-						ct.Defaults = append(ct.Defaults, xmlDefault{
-							Extension:   ext,
-							ContentType: w.getImageContentType(ds),
-						})
-					}
+		for _, ds := range collectDrawingShapes(slide.shapes) {
+			ext := w.getImageExtension(ds)
+			found := false
+			for _, d := range ct.Defaults {
+				if d.Extension == ext {
+					found = true
+					break
 				}
+			}
+			if !found {
+				ct.Defaults = append(ct.Defaults, xmlDefault{
+					Extension:   ext,
+					ContentType: w.getImageContentType(ds),
+				})
 			}
 		}
 	}
-	_ = hasImages
 
 	// Add chart content types
 	chartIdx := 1
