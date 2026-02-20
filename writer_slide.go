@@ -295,7 +295,7 @@ func (w *PPTXWriter) writeRichTextShapeXML(s *RichTextShape, shapeID *int) strin
           </a:prstGeom>
 %s%s        </p:spPr>
         <p:txBody>
-          <a:bodyPr wrap="%s" numCol="%d"%s/>
+          <a:bodyPr wrap="%s" numCol="%d"%s>%s</a:bodyPr>
           <a:lstStyle/>
 %s        </p:txBody>
       </p:sp>
@@ -303,6 +303,7 @@ func (w *PPTXWriter) writeRichTextShapeXML(s *RichTextShape, shapeID *int) strin
 		s.offsetX, s.offsetY, s.width, s.height,
 		fillXML, borderXML,
 		boolToWrap(s.wordWrap), s.columns, textAnchorAttr(s.textAnchor),
+		normAutofitXML(s.fontScale),
 		paragraphsXML.String())
 }
 
@@ -319,6 +320,14 @@ func textAnchorAttr(anchor TextAnchorType) string {
 		return ""
 	}
 	return fmt.Sprintf(` anchor="%s"`, string(anchor))
+}
+
+// normAutofitXML returns the <a:normAutofit> child element for <a:bodyPr> if fontScale is set.
+func normAutofitXML(fontScale int) string {
+	if fontScale > 0 && fontScale != 100000 {
+		return fmt.Sprintf(`<a:normAutofit fontScale="%d"/>`, fontScale)
+	}
+	return ""
 }
 
 func (w *PPTXWriter) writeParagraphXML(para *Paragraph) string {
@@ -344,7 +353,11 @@ func (w *PPTXWriter) writeParagraphXML(para *Paragraph) string {
 	}
 
 	spacing := ""
-	if para.lineSpacing > 0 {
+	if para.lineSpacing < 0 {
+		// spcPct: stored as negative percentage * 1000
+		spacing = fmt.Sprintf(`
+            <a:lnSpc><a:spcPct val="%d"/></a:lnSpc>`, -para.lineSpacing)
+	} else if para.lineSpacing > 0 {
 		spacing = fmt.Sprintf(`
             <a:lnSpc><a:spcPts val="%d"/></a:lnSpc>`, para.lineSpacing)
 	}
@@ -399,6 +412,12 @@ func (w *PPTXWriter) writeTextRunXML(tr *TextRun) string {
               <a:latin typeface="%s"/>`, xmlEscape(font.Name))
 	}
 
+	ea := ""
+	if font.NameEA != "" {
+		ea = fmt.Sprintf(`
+              <a:ea typeface="%s"/>`, xmlEscape(font.NameEA))
+	}
+
 	hlinkStart := ""
 	hlinkEnd := ""
 	if tr.hyperlink != nil && !tr.hyperlink.IsInternal {
@@ -407,11 +426,11 @@ func (w *PPTXWriter) writeTextRunXML(tr *TextRun) string {
 	}
 
 	return fmt.Sprintf(`            <a:r>
-              <a:rPr%s>%s%s%s%s
+              <a:rPr%s>%s%s%s%s%s
               </a:rPr>
               <a:t>%s</a:t>
             </a:r>
-`, attrs, solidFill, latin, hlinkStart, hlinkEnd, xmlEscape(tr.text))
+`, attrs, solidFill, latin, ea, hlinkStart, hlinkEnd, xmlEscape(tr.text))
 }
 
 // --- Drawing Shape XML ---
@@ -546,6 +565,22 @@ func (w *PPTXWriter) writeLineShapeXML(s *LineShape, shapeID *int) string {
 		name = fmt.Sprintf("Line %d", id)
 	}
 
+	// Build headEnd/tailEnd XML
+	var headEndXML, tailEndXML string
+	if s.headEnd != nil && s.headEnd.Type != ArrowNone && s.headEnd.Type != "" {
+		headEndXML = fmt.Sprintf(`
+            <a:headEnd type="%s" w="%s" len="%s"/>`, s.headEnd.Type, s.headEnd.Width, s.headEnd.Length)
+	}
+	if s.tailEnd != nil && s.tailEnd.Type != ArrowNone && s.tailEnd.Type != "" {
+		tailEndXML = fmt.Sprintf(`
+            <a:tailEnd type="%s" w="%s" len="%s"/>`, s.tailEnd.Type, s.tailEnd.Width, s.tailEnd.Length)
+	}
+
+	prstGeom := "line"
+	if s.connectorType != "" {
+		prstGeom = s.connectorType
+	}
+
 	return fmt.Sprintf(`      <p:cxnSp>
         <p:nvCxnSpPr>
           <p:cNvPr id="%d" name="%s"/>
@@ -557,21 +592,23 @@ func (w *PPTXWriter) writeLineShapeXML(s *LineShape, shapeID *int) string {
             <a:off x="%d" y="%d"/>
             <a:ext cx="%d" cy="%d"/>
           </a:xfrm>
-          <a:prstGeom prst="line">
+          <a:prstGeom prst="%s">
             <a:avLst/>
           </a:prstGeom>
           <a:ln w="%d">
             <a:solidFill>
               <a:srgbClr val="%s"/>
-            </a:solidFill>
+            </a:solidFill>%s%s
           </a:ln>
         </p:spPr>
       </p:cxnSp>
 `, id, xmlEscape(name),
 		xfrmAttrs(&s.BaseShape),
 		s.offsetX, s.offsetY, s.width, s.height,
+		prstGeom,
 		int64(s.lineWidth)*12700,
-		colorRGB(s.lineColor))
+		colorRGB(s.lineColor),
+		headEndXML, tailEndXML)
 }
 
 // --- Table Shape XML ---

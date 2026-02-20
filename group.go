@@ -6,6 +6,11 @@ import "errors"
 type GroupShape struct {
 	BaseShape
 	shapes []Shape
+	// Child coordinate space (from grpSpPr xfrm chOff/chExt)
+	childOffX int64
+	childOffY int64
+	childExtX int64
+	childExtY int64
 }
 
 // ShapeTypeGroup is the shape type for groups.

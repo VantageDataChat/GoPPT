@@ -1,0 +1,4 @@
+*.exe
+*.png
+*.pptx
+cmd/debug_*/

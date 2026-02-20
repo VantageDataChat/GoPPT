@@ -97,7 +97,8 @@ func hexVal(c byte) int {
 // Font represents text font properties.
 type Font struct {
 	Name          string
-	Size          int     // in points
+	NameEA        string // East Asian font name (from <a:ea> element)
+	Size          int    // in points
 	Bold          bool
 	Italic        bool
 	Underline     UnderlineType
@@ -279,7 +280,7 @@ func (f *Fill) SetGradientLinear(startColor, endColor Color, rotation int) *Fill
 // Border represents a shape border.
 type Border struct {
 	Style BorderStyle
-	Width int // in EMU
+	Width int // in points (1 pt = 12700 EMU)
 	Color Color
 }
 
@@ -292,6 +293,34 @@ const (
 	BorderDash  BorderStyle = "dash"
 	BorderDot   BorderStyle = "dot"
 )
+
+// ArrowType represents the type of arrow head/tail on a line.
+type ArrowType string
+
+const (
+	ArrowNone     ArrowType = "none"
+	ArrowTriangle ArrowType = "triangle"
+	ArrowStealth  ArrowType = "stealth"
+	ArrowDiamond  ArrowType = "diamond"
+	ArrowOval     ArrowType = "oval"
+	ArrowArrow    ArrowType = "arrow"
+)
+
+// ArrowSize represents the size of an arrow head/tail.
+type ArrowSize string
+
+const (
+	ArrowSizeSm  ArrowSize = "sm"
+	ArrowSizeMed ArrowSize = "med"
+	ArrowSizeLg  ArrowSize = "lg"
+)
+
+// LineEnd represents the arrow head or tail of a line.
+type LineEnd struct {
+	Type   ArrowType
+	Width  ArrowSize
+	Length ArrowSize
+}
 
 // NewBorder creates a new Border with no border.
 func NewBorder() *Border {
@@ -397,5 +426,210 @@ func NewInternalHyperlink(slideNumber int) *Hyperlink {
 	return &Hyperlink{
 		IsInternal:  true,
 		SlideNumber: slideNumber,
+	}
+}
+
+// --- Color modification helpers for OOXML color transforms ---
+
+// rgbToHSL converts RGB (0-255) to HSL (h: 0-360, s: 0-1, l: 0-1).
+func rgbToHSL(r, g, b uint8) (float64, float64, float64) {
+	rf := float64(r) / 255.0
+	gf := float64(g) / 255.0
+	bf := float64(b) / 255.0
+
+	max := rf
+	if gf > max {
+		max = gf
+	}
+	if bf > max {
+		max = bf
+	}
+	min := rf
+	if gf < min {
+		min = gf
+	}
+	if bf < min {
+		min = bf
+	}
+
+	l := (max + min) / 2.0
+	if max == min {
+		return 0, 0, l
+	}
+
+	d := max - min
+	s := d / (1.0 - abs64(2.0*l-1.0))
+
+	var h float64
+	switch max {
+	case rf:
+		h = (gf - bf) / d
+		if gf < bf {
+			h += 6
+		}
+	case gf:
+		h = (bf-rf)/d + 2
+	case bf:
+		h = (rf-gf)/d + 4
+	}
+	h *= 60
+
+	return h, s, l
+}
+
+// hslToRGB converts HSL (h: 0-360, s: 0-1, l: 0-1) to RGB (0-255).
+func hslToRGB(h, s, l float64) (uint8, uint8, uint8) {
+	if s == 0 {
+		v := clamp8(l * 255)
+		return v, v, v
+	}
+
+	var q float64
+	if l < 0.5 {
+		q = l * (1 + s)
+	} else {
+		q = l + s - l*s
+	}
+	p := 2*l - q
+
+	hk := h / 360.0
+	tr := hk + 1.0/3.0
+	tg := hk
+	tb := hk - 1.0/3.0
+
+	hueToRGB := func(t float64) float64 {
+		if t < 0 {
+			t += 1
+		}
+		if t > 1 {
+			t -= 1
+		}
+		switch {
+		case t < 1.0/6.0:
+			return p + (q-p)*6*t
+		case t < 1.0/2.0:
+			return q
+		case t < 2.0/3.0:
+			return p + (q-p)*(2.0/3.0-t)*6
+		default:
+			return p
+		}
+	}
+
+	return clamp8(hueToRGB(tr) * 255), clamp8(hueToRGB(tg) * 255), clamp8(hueToRGB(tb) * 255)
+}
+
+func abs64(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func clamp8(v float64) uint8 {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return uint8(v + 0.5)
+}
+
+// applyLumMod multiplies the luminance by factor (e.g. 0.75 = 75%).
+func applyLumMod(c *Color, factor float64) {
+	r, g, b := c.GetRed(), c.GetGreen(), c.GetBlue()
+	h, s, l := rgbToHSL(r, g, b)
+	l *= factor
+	if l > 1 {
+		l = 1
+	}
+	if l < 0 {
+		l = 0
+	}
+	nr, ng, nb := hslToRGB(h, s, l)
+	c.ARGB = c.ARGB[:2] + colorHex(nr) + colorHex(ng) + colorHex(nb)
+}
+
+// applyLumOff adds offset to luminance (e.g. 0.25 = +25%).
+func applyLumOff(c *Color, offset float64) {
+	r, g, b := c.GetRed(), c.GetGreen(), c.GetBlue()
+	h, s, l := rgbToHSL(r, g, b)
+	l += offset
+	if l > 1 {
+		l = 1
+	}
+	if l < 0 {
+		l = 0
+	}
+	nr, ng, nb := hslToRGB(h, s, l)
+	c.ARGB = c.ARGB[:2] + colorHex(nr) + colorHex(ng) + colorHex(nb)
+}
+
+// applyTint blends the color toward white by the given amount (0-1).
+func applyTint(c *Color, amount float64) {
+	r, g, b := c.GetRed(), c.GetGreen(), c.GetBlue()
+	nr := uint8(float64(r) + (255-float64(r))*amount + 0.5)
+	ng := uint8(float64(g) + (255-float64(g))*amount + 0.5)
+	nb := uint8(float64(b) + (255-float64(b))*amount + 0.5)
+	c.ARGB = c.ARGB[:2] + colorHex(nr) + colorHex(ng) + colorHex(nb)
+}
+
+// applyShade blends the color toward black by the given amount (0-1).
+func applyShade(c *Color, amount float64) {
+	r, g, b := c.GetRed(), c.GetGreen(), c.GetBlue()
+	nr := uint8(float64(r)*amount + 0.5)
+	ng := uint8(float64(g)*amount + 0.5)
+	nb := uint8(float64(b)*amount + 0.5)
+	c.ARGB = c.ARGB[:2] + colorHex(nr) + colorHex(ng) + colorHex(nb)
+}
+
+func colorHex(v uint8) string {
+	const hex = "0123456789ABCDEF"
+	return string([]byte{hex[v>>4], hex[v&0x0f]})
+}
+
+// presetColorToColor converts an OOXML preset color name to a Color.
+// See ECMA-376 §20.1.10.47 for the full list.
+func presetColorToColor(name string) Color {
+	switch name {
+	case "black":
+		return ColorBlack
+	case "white":
+		return ColorWhite
+	case "red":
+		return ColorRed
+	case "green":
+		return ColorGreen
+	case "blue":
+		return ColorBlue
+	case "yellow":
+		return ColorYellow
+	case "cyan", "aqua":
+		return NewColor("FF00FFFF")
+	case "magenta", "fuchsia":
+		return NewColor("FFFF00FF")
+	case "gray", "grey":
+		return NewColor("FF808080")
+	case "dkGray", "darkGray", "darkGrey":
+		return NewColor("FFA9A9A9")
+	case "ltGray", "lightGray", "lightGrey":
+		return NewColor("FFD3D3D3")
+	case "maroon":
+		return NewColor("FF800000")
+	case "olive":
+		return NewColor("FF808000")
+	case "navy":
+		return NewColor("FF000080")
+	case "purple":
+		return NewColor("FF800080")
+	case "teal":
+		return NewColor("FF008080")
+	case "silver":
+		return NewColor("FFC0C0C0")
+	case "orange":
+		return NewColor("FFFFA500")
+	default:
+		return ColorBlack
 	}
 }

@@ -163,3 +163,83 @@ func (r *PPTXReader) readPresentation(zr *zip.Reader, pres *Presentation) ([]str
 
 	return slideRelIDs, nil
 }
+
+// --- Theme Colors ---
+
+// readThemeColors reads the theme XML and extracts the color scheme.
+// It populates pres.themeColors with mappings like "dk1" → "FF000000".
+func (r *PPTXReader) readThemeColors(zr *zip.Reader, pres *Presentation) {
+	// Try common theme paths
+	var data []byte
+	var err error
+	for _, path := range []string{"ppt/theme/theme1.xml", "ppt/theme/theme2.xml"} {
+		data, err = readFileFromZip(zr, path)
+		if err == nil {
+			break
+		}
+	}
+	if data == nil {
+		return
+	}
+
+	pres.themeColors = make(map[string]string)
+	decoder := xml.NewDecoder(strings.NewReader(string(data)))
+
+	// Track which scheme color element we're inside
+	var currentSchemeColor string
+
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			break
+		}
+
+		switch t := token.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "dk1", "dk2", "lt1", "lt2",
+				"accent1", "accent2", "accent3", "accent4", "accent5", "accent6",
+				"hlink", "folHlink":
+				currentSchemeColor = t.Name.Local
+			case "srgbClr":
+				if currentSchemeColor != "" {
+					for _, attr := range t.Attr {
+						if attr.Name.Local == "val" {
+							pres.themeColors[currentSchemeColor] = "FF" + strings.ToUpper(attr.Value)
+						}
+					}
+				}
+			case "sysClr":
+				if currentSchemeColor != "" {
+					for _, attr := range t.Attr {
+						if attr.Name.Local == "lastClr" {
+							pres.themeColors[currentSchemeColor] = "FF" + strings.ToUpper(attr.Value)
+						}
+					}
+				}
+			}
+		case xml.EndElement:
+			switch t.Name.Local {
+			case "dk1", "dk2", "lt1", "lt2",
+				"accent1", "accent2", "accent3", "accent4", "accent5", "accent6",
+				"hlink", "folHlink":
+				currentSchemeColor = ""
+			case "clrScheme":
+				// Also add common aliases
+				if c, ok := pres.themeColors["dk1"]; ok {
+					pres.themeColors["tx1"] = c
+				}
+				if c, ok := pres.themeColors["lt1"]; ok {
+					pres.themeColors["bg1"] = c
+				}
+				if c, ok := pres.themeColors["dk2"]; ok {
+					pres.themeColors["tx2"] = c
+				}
+				if c, ok := pres.themeColors["lt2"]; ok {
+					pres.themeColors["bg2"] = c
+				}
+				return // done
+			}
+		}
+	}
+}

@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
+	"golang.org/x/image/font/sfnt"
 )
 
 // fontKey uniquely identifies a font face by name, size, bold, and italic.
@@ -113,6 +114,40 @@ func (fc *FontCache) findFont(name string, bold, italic bool) *opentype.Font {
 		return f
 	}
 
+	// Try Chinese font name alias
+	if alias, ok := chineseFontAliases[lower]; ok {
+		return fc.findFontByKey(alias, bold, italic)
+	}
+
+	return nil
+}
+
+// findFontByKey looks up a font by its already-lowercased key, with style variants.
+func (fc *FontCache) findFontByKey(lower string, bold, italic bool) *opentype.Font {
+	if bold && italic {
+		for _, suffix := range []string{" bold italic", "bi", " bolditalic", "z"} {
+			if f, ok := fc.fonts[lower+suffix]; ok {
+				return f
+			}
+		}
+	}
+	if bold {
+		for _, suffix := range []string{" bold", "bd", "b"} {
+			if f, ok := fc.fonts[lower+suffix]; ok {
+				return f
+			}
+		}
+	}
+	if italic {
+		for _, suffix := range []string{" italic", "i", " it"} {
+			if f, ok := fc.fonts[lower+suffix]; ok {
+				return f
+			}
+		}
+	}
+	if f, ok := fc.fonts[lower]; ok {
+		return f
+	}
 	return nil
 }
 
@@ -137,6 +172,7 @@ func (fc *FontCache) LoadFont(name string, path string) error {
 	}
 	fc.mu.Lock()
 	fc.fonts[strings.ToLower(name)] = f
+	fc.registerByFamilyName(f)
 	fc.mu.Unlock()
 	return nil
 }
@@ -149,6 +185,7 @@ func (fc *FontCache) LoadFontData(name string, data []byte) error {
 	}
 	fc.mu.Lock()
 	fc.fonts[strings.ToLower(name)] = f
+	fc.registerByFamilyName(f)
 	fc.mu.Unlock()
 	return nil
 }
@@ -198,7 +235,9 @@ func (fc *FontCache) scanDirDepth(dir string, depth int) {
 		}
 		name := entry.Name()
 		lower := strings.ToLower(name)
-		if !strings.HasSuffix(lower, ".ttf") && !strings.HasSuffix(lower, ".otf") {
+		isTTC := strings.HasSuffix(lower, ".ttc") || strings.HasSuffix(lower, ".otc")
+		isSingle := strings.HasSuffix(lower, ".ttf") || strings.HasSuffix(lower, ".otf")
+		if !isTTC && !isSingle {
 			continue
 		}
 
@@ -214,14 +253,85 @@ func (fc *FontCache) scanDirDepth(dir string, depth int) {
 		if err != nil {
 			continue
 		}
-		f, err := opentype.Parse(data)
+
+		if isTTC {
+			fc.loadCollection(data, lower)
+		} else {
+			fc.loadSingleFont(data, lower)
+		}
+	}
+}
+
+// loadSingleFont parses a single TTF/OTF font and registers it by both
+// filename and internal family name.
+func (fc *FontCache) loadSingleFont(data []byte, lowerFilename string) {
+	f, err := opentype.Parse(data)
+	if err != nil {
+		return
+	}
+	baseName := strings.TrimSuffix(lowerFilename, filepath.Ext(lowerFilename))
+	fc.fonts[baseName] = f
+	// Also register by the font's internal family name
+	fc.registerByFamilyName(f)
+}
+
+// loadCollection parses a TTC/OTC font collection and registers each font
+// by its internal family name.
+func (fc *FontCache) loadCollection(data []byte, lowerFilename string) {
+	coll, err := opentype.ParseCollection(data)
+	if err != nil {
+		return
+	}
+	n := coll.NumFonts()
+	for i := 0; i < n; i++ {
+		f, err := coll.Font(i)
 		if err != nil {
 			continue
 		}
+		// Register first font also by base filename for backward compat
+		if i == 0 {
+			baseName := strings.TrimSuffix(lowerFilename, filepath.Ext(lowerFilename))
+			fc.fonts[baseName] = f
+		}
+		fc.registerByFamilyName(f)
+	}
+}
 
-		// Register by filename without extension, lowercased
-		baseName := strings.TrimSuffix(lower, filepath.Ext(lower))
-		fc.fonts[baseName] = f
+// chineseFontAliases maps Chinese font names to their English equivalents.
+// This allows PPTX files that reference fonts by Chinese name to find them
+// in the cache where they're registered by English family name.
+var chineseFontAliases = map[string]string{
+	"宋体":      "simsun",
+	"黑体":      "simhei",
+	"微软雅黑":    "microsoft yahei",
+	"微软雅黑 ui": "microsoft yahei ui",
+	"楷体":      "kaiti",
+	"仿宋":      "fangsong",
+	"新宋体":     "nsimsun",
+	"等线":      "dengxian",
+	"华文细黑":    "stxihei",
+	"华文黑体":    "stheiti",
+	"华文楷体":    "stkaiti",
+	"华文宋体":    "stsong",
+	"华文仿宋":    "stfangsong",
+	"华文中宋":    "stzhongsong",
+	"方正舒体":    "fzshuti",
+	"方正姚体":    "fzyaoti",
+	"隶书":      "lisu",
+	"幼圆":      "youyuan",
+}
+
+// registerByFamilyName extracts the font family name from the font's name
+// table and registers it in the cache.
+func (fc *FontCache) registerByFamilyName(f *opentype.Font) {
+	familyName, err := f.Name(nil, sfnt.NameIDFamily)
+	if err == nil && familyName != "" {
+		fc.fonts[strings.ToLower(familyName)] = f
+	}
+	// Also register by full name (e.g. "Microsoft YaHei Bold")
+	fullName, err := f.Name(nil, sfnt.NameIDFull)
+	if err == nil && fullName != "" {
+		fc.fonts[strings.ToLower(fullName)] = f
 	}
 }
 

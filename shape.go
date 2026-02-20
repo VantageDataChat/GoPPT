@@ -15,6 +15,8 @@ type Shape interface {
 	GetHeight() int64
 	GetName() string
 	GetRotation() int
+	// base returns the underlying BaseShape (unexported, internal use only).
+	base() *BaseShape
 }
 
 // ShapeType represents the type of shape.
@@ -52,6 +54,7 @@ func (b *BaseShape) GetWidth() int64     { return b.width }
 func (b *BaseShape) GetHeight() int64    { return b.height }
 func (b *BaseShape) GetName() string     { return b.name }
 func (b *BaseShape) GetRotation() int    { return b.rotation }
+func (b *BaseShape) base() *BaseShape    { return b }
 
 func (b *BaseShape) SetOffsetX(x int64) *BaseShape  { b.offsetX = x; return b }
 func (b *BaseShape) SetOffsetY(y int64) *BaseShape  { b.offsetY = y; return b }
@@ -125,17 +128,46 @@ func (b *BaseShape) SetShadow(s *Shadow) { b.shadow = s }
 func (b *BaseShape) GetHyperlink() *Hyperlink { return b.hyperlink }
 func (b *BaseShape) SetHyperlink(h *Hyperlink) { b.hyperlink = h }
 
+// CustomGeomPath represents a custom geometry path for freeform shapes.
+type CustomGeomPath struct {
+	Width    int64          // path coordinate space width
+	Height   int64          // path coordinate space height
+	Commands []PathCommand  // path commands (moveTo, lineTo, close, etc.)
+}
+
+// PathCommand represents a single path command.
+type PathCommand struct {
+	Type string  // "moveTo", "lnTo", "close", "cubicBezTo", "quadBezTo", "arcTo"
+	Pts  []PathPoint
+}
+
+// PathPoint represents a point in path coordinates.
+type PathPoint struct {
+	X, Y int64
+}
+
 // RichTextShape represents a rich text shape.
 type RichTextShape struct {
 	BaseShape
-	paragraphs     []*Paragraph
+	paragraphs      []*Paragraph
 	activeParagraph int
-	autoFit        AutoFitType
-	wordWrap       bool
-	verticalAlign  VerticalAlignment
-	textAnchor     TextAnchorType
-	columns        int
-	columnSpacing  int64
+	autoFit         AutoFitType
+	fontScale       int // normAutofit fontScale in thousandths of a percent (e.g. 62500 = 62.5%), 0 means 100%
+	wordWrap        bool
+	verticalAlign   VerticalAlignment
+	textAnchor      TextAnchorType
+	textDirection   string // "horz", "vert", "vert270", "eaVert", etc.
+	columns         int
+	columnSpacing   int64
+	// Text insets (padding) in EMU. Defaults: lIns=91440, rIns=91440, tIns=45720, bIns=45720
+	insetLeft   int64
+	insetRight  int64
+	insetTop    int64
+	insetBottom int64
+	insetsSet   bool // true if insets were explicitly parsed from XML
+	customPath  *CustomGeomPath // non-nil for freeform/custGeom shapes
+	headEnd     *LineEnd        // arrow at start of custom path (from <a:ln><a:headEnd>)
+	tailEnd     *LineEnd        // arrow at end of custom path (from <a:ln><a:tailEnd>)
 }
 
 // TextAnchorType represents the text anchoring type within a shape.
@@ -262,6 +294,11 @@ func (r *RichTextShape) SetTextAnchor(anchor TextAnchorType) {
 // GetTextAnchor returns the text anchoring type.
 func (r *RichTextShape) GetTextAnchor() TextAnchorType {
 	return r.textAnchor
+}
+
+// GetCustomPath returns the custom geometry path, if any.
+func (r *RichTextShape) GetCustomPath() *CustomGeomPath {
+	return r.customPath
 }
 
 // Paragraph represents a text paragraph.
@@ -492,8 +529,19 @@ func (d *DrawingShape) SetOffsetY(y int64) *DrawingShape {
 // AutoShape represents a predefined shape (rectangle, ellipse, etc.).
 type AutoShape struct {
 	BaseShape
-	shapeType AutoShapeType
-	text      string
+	shapeType    AutoShapeType
+	text         string
+	paragraphs   []*Paragraph
+	textAnchor   TextAnchorType
+	textDirection string
+	adjustValues map[string]int // avLst adjustment values (e.g. "adj1" -> 10690)
+	fontScale    int            // normAutofit fontScale in thousandths of a percent (e.g. 62500 = 62.5%), 0 means 100%
+	// Text insets (padding) in EMU.
+	insetLeft   int64
+	insetRight  int64
+	insetTop    int64
+	insetBottom int64
+	insetsSet   bool
 }
 
 // AutoShapeType represents the type of auto shape.
@@ -526,8 +574,9 @@ const (
 	AutoShapeCloud           AutoShapeType = "cloud"
 	AutoShapePlus            AutoShapeType = "mathPlus"
 	AutoShapeMinus           AutoShapeType = "mathMinus"
-	AutoShapeFlowchartProcess AutoShapeType = "flowChartProcess"
-	AutoShapeFlowchartDecision AutoShapeType = "flowChartDecision"
+	AutoShapeFlowchartProcess    AutoShapeType = "flowChartProcess"
+	AutoShapeFlowchartDecision   AutoShapeType = "flowChartDecision"
+	AutoShapeFlowchartPreparation AutoShapeType = "flowChartPreparation"
 	AutoShapeCallout1        AutoShapeType = "wedgeRoundRectCallout"
 	AutoShapeCallout2        AutoShapeType = "wedgeEllipseCallout"
 	AutoShapeRibbon          AutoShapeType = "ribbon2"
@@ -541,6 +590,15 @@ const (
 	AutoShapeFoldedCorner    AutoShapeType = "foldedCorner"
 	AutoShapeFrame           AutoShapeType = "frame"
 	AutoShapePlaque          AutoShapeType = "plaque"
+	AutoShapeLeftRightArrow  AutoShapeType = "leftRightArrow"
+	AutoShapeRtTriangle      AutoShapeType = "rtTriangle"
+	AutoShapeHomePlate       AutoShapeType = "homePlate"
+	AutoShapeSnip2SameRect   AutoShapeType = "snip2SameRect"
+	AutoShapePie             AutoShapeType = "pie"
+	AutoShapeArc             AutoShapeType = "arc"
+	AutoShapeBentArrow       AutoShapeType = "bentArrow"
+	AutoShapeUturnArrow      AutoShapeType = "uturnArrow"
+	AutoShapeMathEqual       AutoShapeType = "mathEqual"
 )
 
 func (a *AutoShape) GetType() ShapeType { return ShapeTypeAutoShape }
@@ -587,12 +645,26 @@ func (a *AutoShape) GetText() string {
 	return a.text
 }
 
+// GetParagraphs returns the rich text paragraphs (if any).
+func (a *AutoShape) GetParagraphs() []*Paragraph {
+	return a.paragraphs
+}
+
+// GetAdjustValues returns the adjustment values map.
+func (a *AutoShape) GetAdjustValues() map[string]int {
+	return a.adjustValues
+}
+
 // LineShape represents a line shape.
 type LineShape struct {
 	BaseShape
-	lineStyle BorderStyle
-	lineWidth int
-	lineColor Color
+	lineStyle     BorderStyle
+	lineWidth     int
+	lineColor     Color
+	headEnd       *LineEnd
+	tailEnd       *LineEnd
+	connectorType string         // prstGeom value: "line", "straightConnector1", "bentConnector3", etc.
+	adjustValues  map[string]int // adjustment values for connector geometry
 }
 
 func (l *LineShape) GetType() ShapeType { return ShapeTypeLine }
@@ -633,12 +705,38 @@ func (l *LineShape) SetLineColor(c Color) *LineShape {
 // GetLineColor returns the line color.
 func (l *LineShape) GetLineColor() Color { return l.lineColor }
 
+// SetHeadEnd sets the head end (arrow at start of line).
+func (l *LineShape) SetHeadEnd(e *LineEnd) *LineShape {
+	l.headEnd = e
+	return l
+}
+
+// GetHeadEnd returns the head end.
+func (l *LineShape) GetHeadEnd() *LineEnd { return l.headEnd }
+
+// SetTailEnd sets the tail end (arrow at end of line).
+func (l *LineShape) SetTailEnd(e *LineEnd) *LineShape {
+	l.tailEnd = e
+	return l
+}
+
+// GetTailEnd returns the tail end.
+func (l *LineShape) GetTailEnd() *LineEnd { return l.tailEnd }
+
+// GetConnectorType returns the connector type (prstGeom value).
+func (l *LineShape) GetConnectorType() string { return l.connectorType }
+
+// GetAdjustValues returns the adjustment values for connector geometry.
+func (l *LineShape) GetAdjustValues() map[string]int { return l.adjustValues }
+
 // TableShape represents a table shape.
 type TableShape struct {
 	BaseShape
-	rows    [][]*TableCell
-	numRows int
-	numCols int
+	rows      [][]*TableCell
+	numRows   int
+	numCols   int
+	colWidths []int64 // individual column widths in EMU (from gridCol)
+	rowHeights []int64 // individual row heights in EMU (from tr)
 }
 
 func (t *TableShape) GetType() ShapeType { return ShapeTypeTable }
@@ -697,6 +795,8 @@ type TableCell struct {
 	border     *CellBorders
 	colSpan    int
 	rowSpan    int
+	hMerge     bool // continuation of horizontal merge (skip rendering)
+	vMerge     bool // continuation of vertical merge (skip rendering)
 }
 
 // CellBorders represents borders for a table cell.

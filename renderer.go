@@ -14,10 +14,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
 	"golang.org/x/image/math/fixed"
+	_ "golang.org/x/image/tiff"
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 // ImageFormat represents the output image format.
@@ -47,6 +50,10 @@ type RenderOptions struct {
 	// FontCache allows sharing a pre-configured FontCache across multiple renders.
 	// If nil, a new FontCache is created using FontDirs.
 	FontCache *FontCache
+	// OverlayOpacityScale scales the opacity of semi-transparent shape fills.
+	// Value between 0.0 and 1.0. Default 0 means use 1.0 (no change).
+	// Set to e.g. 0.5 to halve the opacity of overlays, making dark backgrounds brighter.
+	OverlayOpacityScale float64
 }
 
 // DefaultRenderOptions returns default rendering options.
@@ -94,11 +101,12 @@ func (p *Presentation) SlideToImage(slideIndex int, opts *RenderOptions) (image.
 	}
 
 	r := &renderer{
-		img:       img,
-		scaleX:    scaleX,
-		scaleY:    scaleY,
-		fontCache: fc,
-		dpi:       dpi,
+		img:                 img,
+		scaleX:              scaleX,
+		scaleY:              scaleY,
+		fontCache:           fc,
+		dpi:                 dpi,
+		overlayOpacityScale: opts.OverlayOpacityScale,
 	}
 
 	// Fill background
@@ -123,7 +131,16 @@ func (p *Presentation) SlideToImage(slideIndex int, opts *RenderOptions) (image.
 	}
 
 	for _, shape := range slide.shapes {
-		r.renderShape(shape)
+		if _, isLine := shape.(*LineShape); !isLine {
+			r.renderShape(shape)
+		}
+	}
+	// Render connectors (LineShape) last so they appear on top,
+	// matching PowerPoint's connector rendering order.
+	for _, shape := range slide.shapes {
+		if _, isLine := shape.(*LineShape); isLine {
+			r.renderShape(shape)
+		}
 	}
 
 	return img, nil
@@ -204,11 +221,13 @@ func saveImage(img image.Image, path string, opts *RenderOptions) error {
 // --- renderer core ---
 
 type renderer struct {
-	img       *image.RGBA
-	scaleX    float64
-	scaleY    float64
-	fontCache *FontCache
-	dpi       float64
+	img                 *image.RGBA
+	scaleX              float64
+	scaleY              float64
+	fontCache           *FontCache
+	dpi                 float64
+	overlayOpacityScale float64 // 0 means 1.0 (no change)
+	fontScale           float64 // normAutofit font scale factor (0 or 1.0 = no scaling)
 }
 
 func (r *renderer) renderShape(shape Shape) {
@@ -232,8 +251,16 @@ func (r *renderer) renderShape(shape Shape) {
 	}
 }
 
-func (r *renderer) emuToPixelX(emu int64) int { return int(float64(emu) * r.scaleX) }
-func (r *renderer) emuToPixelY(emu int64) int { return int(float64(emu) * r.scaleY) }
+func (r *renderer) emuToPixelX(emu int64) int { return int(math.Round(float64(emu) * r.scaleX)) }
+func (r *renderer) emuToPixelY(emu int64) int { return int(math.Round(float64(emu) * r.scaleY)) }
+
+// hundredthPtToPixelY converts hundredths of a point (from spcPts) to pixels.
+// spcPts values are in 1/100 of a point, e.g. 1200 = 12pt.
+// 1 point = 12700 EMU, so 1/100 point = 127 EMU.
+func (r *renderer) hundredthPtToPixelY(val int) int {
+	emu := float64(val) * 127.0
+	return int(emu * r.scaleY)
+}
 
 func argbToRGBA(c Color) color.RGBA {
 	return color.RGBA{R: c.GetRed(), G: c.GetGreen(), B: c.GetBlue(), A: c.GetAlpha()}
@@ -334,22 +361,92 @@ func rotatedBounds(cx, cy float64, w, h int, angleDeg int) image.Rectangle {
 	)
 }
 
+// rotateAndComposite rotates src (sw x sh) by angleDeg and composites it into
+// dst at (dx, dy) fitting into a dw x dh area. Used for vertical text where
+// the text is drawn into a buffer with swapped dimensions then rotated back.
+func rotateAndComposite(dst *image.RGBA, src *image.RGBA, dx, dy, dw, dh, angleDeg int) {
+	sw := src.Bounds().Dx()
+	sh := src.Bounds().Dy()
+	if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 {
+		return
+	}
+	rad := float64(angleDeg) * math.Pi / 180.0
+	cosA := math.Cos(rad)
+	sinA := math.Sin(rad)
+	// Center of source
+	scx := float64(sw) / 2
+	scy := float64(sh) / 2
+	// Center of destination area
+	dcx := float64(dx) + float64(dw)/2
+	dcy := float64(dy) + float64(dh)/2
+
+	dstBounds := dst.Bounds()
+	minDY := maxInt(dy, dstBounds.Min.Y)
+	maxDY := minInt(dy+dh, dstBounds.Max.Y)
+	minDX := maxInt(dx, dstBounds.Min.X)
+	maxDX := minInt(dx+dw, dstBounds.Max.X)
+
+	for py := minDY; py < maxDY; py++ {
+		ry := float64(py) - dcy
+		for px := minDX; px < maxDX; px++ {
+			rx := float64(px) - dcx
+			// Inverse rotation to find source pixel
+			sx := rx*cosA + ry*sinA + scx
+			sy := -rx*sinA + ry*cosA + scy
+			ix, iy := int(sx), int(sy)
+			if ix >= 0 && ix < sw && iy >= 0 && iy < sh {
+				sOff := iy*src.Stride + ix*4
+				a := src.Pix[sOff+3]
+				if a == 0 {
+					continue
+				}
+				dOff := py*dst.Stride + px*4
+				if a == 255 || dst.Pix[dOff+3] == 0 {
+					copy(dst.Pix[dOff:dOff+4], src.Pix[sOff:sOff+4])
+				} else {
+					// Alpha blend
+					sa := uint32(a)
+					da := uint32(dst.Pix[dOff+3])
+					outA := sa + da*(255-sa)/255
+					if outA > 0 {
+						dst.Pix[dOff] = uint8((uint32(src.Pix[sOff])*sa + uint32(dst.Pix[dOff])*(255-sa)) / 255)
+						dst.Pix[dOff+1] = uint8((uint32(src.Pix[sOff+1])*sa + uint32(dst.Pix[dOff+1])*(255-sa)) / 255)
+						dst.Pix[dOff+2] = uint8((uint32(src.Pix[sOff+2])*sa + uint32(dst.Pix[dOff+2])*(255-sa)) / 255)
+						dst.Pix[dOff+3] = uint8(outA)
+					}
+				}
+			}
+		}
+	}
+}
+
 func (r *renderer) renderRotated(x, y, w, h, rotation int, flipH, flipV bool, drawFn func(tmp *renderer)) {
+	r.renderRotatedExpanded(x, y, w, h, h, rotation, flipH, flipV, drawFn)
+}
+
+
+// renderRotatedExpanded is like renderRotated but uses bufH for the temp buffer
+// height, allowing text to overflow the shape bounds without being clipped.
+// The rotation center remains at the center of the original shape (w × h).
+func (r *renderer) renderRotatedExpanded(x, y, w, h, bufH, rotation int, flipH, flipV bool, drawFn func(tmp *renderer)) {
 	if w <= 0 || h <= 0 {
 		return
 	}
-	tmp := image.NewRGBA(image.Rect(0, 0, w, h))
-	tmpR := &renderer{img: tmp, scaleX: r.scaleX, scaleY: r.scaleY, fontCache: r.fontCache, dpi: r.dpi}
+	if bufH < h {
+		bufH = h
+	}
+	tmp := image.NewRGBA(image.Rect(0, 0, w, bufH))
+	tmpR := &renderer{img: tmp, scaleX: r.scaleX, scaleY: r.scaleY, fontCache: r.fontCache, dpi: r.dpi, fontScale: r.fontScale}
 	drawFn(tmpR)
 
 	// Apply flips using direct Pix access
 	if flipH || flipV {
 		flipped := image.NewRGBA(tmp.Bounds())
 		stride := tmp.Stride
-		for py := 0; py < h; py++ {
+		for py := 0; py < bufH; py++ {
 			sy := py
 			if flipV {
-				sy = h - 1 - py
+				sy = bufH - 1 - py
 			}
 			srcRow := sy * stride
 			dstRow := py * flipped.Stride
@@ -368,19 +465,20 @@ func (r *renderer) renderRotated(x, y, w, h, rotation int, flipH, flipV bool, dr
 	}
 
 	if rotation == 0 {
-		draw.Draw(r.img, image.Rect(x, y, x+w, y+h), tmp, image.Point{}, draw.Over)
+		draw.Draw(r.img, image.Rect(x, y, x+w, y+bufH), tmp, image.Point{}, draw.Over)
 		return
 	}
 
-	rad := float64(rotation) * math.Pi / 180.0
+	// OOXML rotation is clockwise; negate for standard math CCW rotation matrix.
+	rad := -float64(rotation) * math.Pi / 180.0
 	cosA := math.Cos(rad)
 	sinA := math.Sin(rad)
 	cx := float64(w) / 2
-	cy := float64(h) / 2
+	cy := float64(h) / 2 // rotation center at original shape center
 	destCX := float64(x) + cx
 	destCY := float64(y) + cy
 
-	bounds := rotatedBounds(destCX, destCY, w, h, rotation)
+	bounds := rotatedBounds(destCX, destCY, w, bufH, rotation)
 	imgBounds := r.img.Bounds()
 	// Clamp to image bounds
 	minDY := maxInt(bounds.Min.Y, imgBounds.Min.Y)
@@ -395,7 +493,7 @@ func (r *renderer) renderRotated(x, y, w, h, rotation int, flipH, flipV bool, dr
 			sx := rx*cosA + ry*sinA + cx
 			sy := -rx*sinA + ry*cosA + cy
 			ix, iy := int(sx), int(sy)
-			if ix >= 0 && ix < w && iy >= 0 && iy < h {
+			if ix >= 0 && ix < w && iy >= 0 && iy < bufH {
 				sOff := iy*tmp.Stride + ix*4
 				if tmp.Pix[sOff+3] > 0 {
 					r.blendPixel(dx, dy, color.RGBA{
@@ -409,6 +507,28 @@ func (r *renderer) renderRotated(x, y, w, h, rotation int, flipH, flipV bool, dr
 }
 
 func (r *renderer) renderGroup(g *GroupShape) {
+	// Transform child coordinates from child space (chOff/chExt) to group space (off/ext)
+	if g.childExtX > 0 && g.childExtY > 0 {
+		for _, gs := range g.shapes {
+			bs := gs.base()
+			origX := bs.offsetX
+			origY := bs.offsetY
+			origW := bs.width
+			origH := bs.height
+			bs.offsetX = g.offsetX + (origX-g.childOffX)*g.width/g.childExtX
+			bs.offsetY = g.offsetY + (origY-g.childOffY)*g.height/g.childExtY
+			bs.width = origW * g.width / g.childExtX
+			bs.height = origH * g.height / g.childExtY
+			defer func(s Shape, ox, oy, ow, oh int64) {
+				b := s.base()
+				b.offsetX = ox
+				b.offsetY = oy
+				b.width = ow
+				b.height = oh
+			}(gs, origX, origY, origW, origH)
+		}
+	}
+
 	rotation := g.GetRotation()
 	flipH := g.GetFlipHorizontal()
 	flipV := g.GetFlipVertical()
@@ -429,6 +549,7 @@ func (r *renderer) renderGroup(g *GroupShape) {
 	})
 }
 
+
 // --- Shape rendering ---
 
 func (r *renderer) renderRichText(s *RichTextShape) {
@@ -439,6 +560,91 @@ func (r *renderer) renderRichText(s *RichTextShape) {
 	rotation := s.GetRotation()
 	flipH := s.GetFlipHorizontal()
 	flipV := s.GetFlipVertical()
+
+	// Apply normAutofit font scale
+	prevFontScale := r.fontScale
+	if s.fontScale > 0 && s.fontScale != 100000 {
+		r.fontScale = float64(s.fontScale) / 100000.0
+	}
+	defer func() { r.fontScale = prevFontScale }()
+
+	// Text insets (padding). PowerPoint defaults: lIns=91440, rIns=91440, tIns=45720, bIns=45720
+	lIns, rIns, tIns, bIns := int64(91440), int64(91440), int64(45720), int64(45720)
+	if s.insetsSet {
+		lIns, rIns, tIns, bIns = s.insetLeft, s.insetRight, s.insetTop, s.insetBottom
+	}
+	pxL := r.emuToPixelX(lIns)
+	pxR := r.emuToPixelX(rIns)
+	pxT := r.emuToPixelY(tIns)
+	pxB := r.emuToPixelY(bIns)
+
+	// Clamp default insets when they consume too much of the shape dimensions.
+	// This happens for small shapes inside nested groups where group coordinate
+	// transforms scale shape dimensions but insets remain absolute EMU values.
+	if !s.insetsSet {
+		maxInsetH := int(float64(h) * 0.35)
+		maxInsetW := int(float64(w) * 0.35)
+		if pxT+pxB > maxInsetH {
+			scale := float64(maxInsetH) / float64(pxT+pxB)
+			pxT = int(float64(pxT) * scale)
+			pxB = int(float64(pxB) * scale)
+		}
+		if pxL+pxR > maxInsetW {
+			scale := float64(maxInsetW) / float64(pxL+pxR)
+			pxL = int(float64(pxL) * scale)
+			pxR = int(float64(pxR) * scale)
+		}
+	}
+
+	// Vertical text direction adds implicit rotation
+	vertRotation := 0
+	if s.textDirection == "vert" || s.textDirection == "eaVert" || s.textDirection == "wordArtVert" {
+		vertRotation = 270
+	} else if s.textDirection == "vert270" {
+		vertRotation = 90
+	}
+
+	// Estimate total text height to detect overflow.
+	// PowerPoint does not clip text to the text box boundary, so we must
+	// expand the rendering buffer when text overflows.
+	tw := w - pxL - pxR
+	th := h - pxT - pxB
+	if tw < 1 {
+		tw = w
+	}
+	if th < 1 {
+		th = h
+	}
+
+	// Auto-shrink text when normAutofit is set without an explicit fontScale.
+	// PowerPoint dynamically calculates the scale to fit text within the box.
+	if s.autoFit == AutoFitNormal && (s.fontScale == 0 || s.fontScale == 100000) {
+		textH := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, s.wordWrap)
+		if textH > th && th > 0 {
+			// Binary search for the right scale factor
+			lo, hi := 0.1, 1.0
+			for i := 0; i < 10; i++ {
+				mid := (lo + hi) / 2
+				r.fontScale = mid
+				mh := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, s.wordWrap)
+				if mh > th {
+					hi = mid
+				} else {
+					lo = mid
+				}
+			}
+			r.fontScale = lo
+		}
+	}
+
+	textH := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, s.wordWrap)
+	// Extra height needed beyond the shape box
+	overflowH := 0
+	if textH+pxT+pxB > h {
+		overflowH = textH + pxT + pxB - h
+	}
+	// Use expanded height for the temp buffer when rotated
+	bufH := h + overflowH
 
 	drawContent := func(tr *renderer) {
 		ox, oy := x, y
@@ -451,16 +657,88 @@ func (r *renderer) renderRichText(s *RichTextShape) {
 		if s.shadow != nil && s.shadow.Visible {
 			tr.renderShadow(s.shadow, rect)
 		}
-		tr.renderFill(s.fill, rect)
-		if s.border != nil && s.border.Style != BorderNone {
-			pw := maxInt(int(float64(maxInt(s.border.Width, 1))*tr.scaleX), 1)
-			tr.drawRectBorder(rect, argbToRGBA(s.border.Color), pw, s.border.Style)
+		if s.customPath != nil {
+			tr.renderCustomPathFill(s.customPath, s.fill, ox, oy, w, h)
+		} else {
+			tr.renderFill(s.fill, rect)
 		}
-		tr.drawParagraphs(s.paragraphs, ox, oy, w, h, s.textAnchor)
+		if s.border != nil && s.border.Style != BorderNone {
+			pw := maxInt(int(float64(maxInt(s.border.Width, 1))*12700.0*tr.scaleX), 1)
+			if s.customPath != nil {
+				// Draw border along the custom geometry path
+				pts := tr.customPathToPixelPoints(s.customPath, ox, oy, w, h)
+				bc := argbToRGBA(s.border.Color)
+				if len(pts) >= 2 {
+					if s.border.Style == BorderDash || s.border.Style == BorderDot {
+						tr.drawDashedPolylineAA(pts, bc, pw, s.border.Style)
+					} else {
+						for i := 1; i < len(pts); i++ {
+							tr.drawLineAA(int(pts[i-1].x), int(pts[i-1].y), int(pts[i].x), int(pts[i].y), bc, pw)
+						}
+					}
+					// Draw arrowheads at the ends of the custom path
+					intPts := make([][2]int, len(pts))
+					for i, p := range pts {
+						intPts[i] = [2]int{int(p.x), int(p.y)}
+					}
+					if s.headEnd != nil && s.headEnd.Type != ArrowNone && s.headEnd.Type != "" {
+						tr.drawArrowOnPath(intPts[0][0], intPts[0][1], intPts, bc, pw, s.headEnd)
+					}
+					if s.tailEnd != nil && s.tailEnd.Type != ArrowNone && s.tailEnd.Type != "" {
+						last := intPts[len(intPts)-1]
+						tr.drawArrowOnPath(last[0], last[1], intPts, bc, pw, s.tailEnd)
+					}
+				}
+			} else {
+				tr.drawRectBorder(rect, argbToRGBA(s.border.Color), pw, s.border.Style)
+			}
+		} else if s.customPath != nil && (s.headEnd != nil || s.tailEnd != nil) {
+			// No visible border but has arrowheads — still need to draw them along the path
+			pts := tr.customPathToPixelPoints(s.customPath, ox, oy, w, h)
+			if len(pts) >= 2 {
+				pw := maxInt(int(tr.scaleX*12700.0), 1)
+				bc := color.RGBA{A: 255} // default black
+				if s.border != nil {
+					bc = argbToRGBA(s.border.Color)
+				}
+				intPts := make([][2]int, len(pts))
+				for i, p := range pts {
+					intPts[i] = [2]int{int(p.x), int(p.y)}
+				}
+				if s.headEnd != nil && s.headEnd.Type != ArrowNone && s.headEnd.Type != "" {
+					tr.drawArrowOnPath(intPts[0][0], intPts[0][1], intPts, bc, pw, s.headEnd)
+				}
+				if s.tailEnd != nil && s.tailEnd.Type != ArrowNone && s.tailEnd.Type != "" {
+					last := intPts[len(intPts)-1]
+					tr.drawArrowOnPath(last[0], last[1], intPts, bc, pw, s.tailEnd)
+				}
+			}
+		}
+
+		// Text area with insets applied; use bufH to allow overflow
+		tx := ox + pxL
+		ty := oy + pxT
+		drawTH := bufH - pxT - pxB
+		if drawTH < th {
+			drawTH = th
+		}
+
+		if vertRotation != 0 {
+			// For vertical text, draw into a rotated buffer with swapped dimensions.
+			vtw, vth := drawTH, tw // text area: width=drawTH, height=tw (before rotation)
+			if vtw > 0 && vth > 0 {
+				tmp := image.NewRGBA(image.Rect(0, 0, vtw, vth))
+				tmpR := &renderer{img: tmp, scaleX: tr.scaleX, scaleY: tr.scaleY, fontCache: tr.fontCache, dpi: tr.dpi, fontScale: tr.fontScale}
+				tmpR.drawParagraphs(s.paragraphs, 0, 0, vtw, vth, s.textAnchor, s.wordWrap)
+				rotateAndComposite(tr.img, tmp, tx, ty, tw, drawTH, vertRotation)
+			}
+		} else {
+			tr.drawParagraphs(s.paragraphs, tx, ty, tw, drawTH, s.textAnchor, s.wordWrap)
+		}
 	}
 
 	if rotation != 0 || flipH || flipV {
-		r.renderRotated(x, y, w, h, rotation, flipH, flipV, drawContent)
+		r.renderRotatedExpanded(x, y, w, h, bufH, rotation, flipH, flipV, drawContent)
 	} else {
 		drawContent(r)
 	}
@@ -483,6 +761,13 @@ func (r *renderer) renderDrawing(s *DrawingShape) {
 	}
 
 	srcImg, _, err := image.Decode(bytes.NewReader(imgData))
+	if err != nil {
+		// Try to extract bitmap from WMF/EMF metafiles
+		if extracted := decodeMetafileBitmap(imgData, r.fontCache); extracted != nil {
+			srcImg = extracted
+			err = nil
+		}
+	}
 	if err != nil {
 		r.drawRect(image.Rect(x, y, x+w, y+h), color.RGBA{R: 200, G: 200, B: 200, A: 255}, 1)
 		return
@@ -508,6 +793,7 @@ func (r *renderer) renderDrawing(s *DrawingShape) {
 	}
 }
 
+
 func (r *renderer) renderAutoShape(s *AutoShape) {
 	x := r.emuToPixelX(s.offsetX)
 	y := r.emuToPixelY(s.offsetY)
@@ -516,6 +802,21 @@ func (r *renderer) renderAutoShape(s *AutoShape) {
 	rotation := s.GetRotation()
 	flipH := s.GetFlipHorizontal()
 	flipV := s.GetFlipVertical()
+
+	// Apply normAutofit font scale
+	prevFontScale := r.fontScale
+	if s.fontScale > 0 && s.fontScale != 100000 {
+		r.fontScale = float64(s.fontScale) / 100000.0
+	}
+	defer func() { r.fontScale = prevFontScale }()
+
+	// Vertical text direction
+	vertRotation := 0
+	if s.textDirection == "vert" || s.textDirection == "eaVert" || s.textDirection == "wordArtVert" {
+		vertRotation = 270
+	} else if s.textDirection == "vert270" {
+		vertRotation = 90
+	}
 
 	drawContent := func(tr *renderer) {
 		ox, oy := x, y
@@ -528,12 +829,103 @@ func (r *renderer) renderAutoShape(s *AutoShape) {
 		}
 		tr.renderAutoShapeFill(s, ox, oy, w, h)
 		tr.renderAutoShapeBorder(s, ox, oy, w, h)
-		if s.text != "" {
+		if len(s.paragraphs) > 0 {
+			// Compute text area with insets
+			lIns, rIns, tIns, bIns := int64(91440), int64(91440), int64(45720), int64(45720)
+			if s.insetsSet {
+				lIns, rIns, tIns, bIns = s.insetLeft, s.insetRight, s.insetTop, s.insetBottom
+			}
+			pxL := r.emuToPixelX(lIns)
+			pxR := r.emuToPixelX(rIns)
+			pxT := r.emuToPixelY(tIns)
+			pxB := r.emuToPixelY(bIns)
+
+			// Clamp default insets when they consume too much of the shape dimensions.
+			if !s.insetsSet {
+				maxInsetH := int(float64(h) * 0.35)
+				maxInsetW := int(float64(w) * 0.35)
+				if pxT+pxB > maxInsetH {
+					scale := float64(maxInsetH) / float64(pxT+pxB)
+					pxT = int(float64(pxT) * scale)
+					pxB = int(float64(pxB) * scale)
+				}
+				if pxL+pxR > maxInsetW {
+					scale := float64(maxInsetW) / float64(pxL+pxR)
+					pxL = int(float64(pxL) * scale)
+					pxR = int(float64(pxR) * scale)
+				}
+			}
+
+			tx, ty, tw, th := ox+pxL, oy+pxT, w-pxL-pxR, h-pxT-pxB
+
+			// For ellipses, further constrain text to the inscribed rectangle
+			// The inscribed rect of an ellipse insets by factor (1 - 1/√2) ≈ 0.2929
+			if s.shapeType == AutoShapeEllipse {
+				insetX := int(float64(w) * 0.1464) // half of 0.2929
+				insetY := int(float64(h) * 0.1464)
+				etx := ox + insetX
+				ety := oy + insetY
+				etw := w - 2*insetX
+				eth := h - 2*insetY
+				// Use the tighter of explicit insets vs ellipse inscribed rect
+				if etx > tx {
+					tx = etx
+				}
+				if ety > ty {
+					ty = ety
+				}
+				if etx+etw < ox+pxL+tw {
+					tw = etx + etw - tx
+				}
+				if ety+eth < oy+pxT+th {
+					th = ety + eth - ty
+				}
+			}
+
+			if tw < 1 {
+				tw = w
+			}
+			if th < 1 {
+				th = h
+			}
+
+			if vertRotation != 0 {
+				vtw, vth := th, tw
+				if vtw > 0 && vth > 0 {
+					tmp := image.NewRGBA(image.Rect(0, 0, vtw, vth))
+					tmpR := &renderer{img: tmp, scaleX: tr.scaleX, scaleY: tr.scaleY, fontCache: tr.fontCache, dpi: tr.dpi, fontScale: tr.fontScale}
+					tmpR.drawParagraphs(s.paragraphs, 0, 0, vtw, vth, s.textAnchor, true)
+					rotateAndComposite(tr.img, tmp, tx, ty, tw, th, vertRotation)
+				}
+			} else {
+				tr.drawParagraphs(s.paragraphs, tx, ty, tw, th, s.textAnchor, true)
+			}
+		} else if s.text != "" {
 			tr.drawStringCentered(s.text, tr.getFace(NewFont()), color.RGBA{A: 255}, rect)
 		}
 	}
 
-	if rotation != 0 || flipH || flipV {
+	// For uturnArrow with 90°/270° rotation, swap geometry dimensions.
+	// OOXML preset geometry formulas use w/h as the shape dimensions.
+	// For 90°/270° rotations, PowerPoint computes the geometry with
+	// swapped dimensions so the arrow spans the full visual extent.
+	needsGeomSwap := s.shapeType == AutoShapeUturnArrow &&
+		(rotation == 90 || rotation == 270)
+
+	if needsGeomSwap {
+		// For 90°/270° rotated uturnArrow, OOXML specifies the bounding box
+		// as the ROTATED visual size. The unrotated shape dimensions are
+		// swapped (w↔h). We draw the geometry transposed in the w×h buffer
+		// so that after rotation it maps correctly.
+		drawSwapped := func(tr *renderer) {
+			if s.fill != nil && s.fill.Type != FillNone {
+				fc := argbToRGBA(s.fill.Color)
+				fc = tr.scaleAlpha(fc)
+				tr.fillUturnArrowTransposed(0, 0, w, h, fc, s.adjustValues)
+			}
+		}
+		r.renderRotated(x, y, w, h, rotation, flipH, flipV, drawSwapped)
+	} else if rotation != 0 || flipH || flipV {
 		r.renderRotated(x, y, w, h, rotation, flipH, flipV, drawContent)
 	} else {
 		drawContent(r)
@@ -545,6 +937,7 @@ func (r *renderer) renderAutoShapeFill(s *AutoShape, x, y, w, h int) {
 		return
 	}
 	fc := argbToRGBA(s.fill.Color)
+	fc = r.scaleAlpha(fc)
 	rect := image.Rect(x, y, x+w, y+h)
 
 	switch s.shapeType {
@@ -567,6 +960,8 @@ func (r *renderer) renderAutoShapeFill(s *AutoShape, x, y, w, h int) {
 		r.fillDiamond(x, y, w, h, fc)
 	case AutoShapeHexagon:
 		r.fillHexagon(x, y, w, h, fc)
+	case AutoShapeFlowchartPreparation:
+		r.fillHexagon(x, y, w, h, fc)
 	case AutoShapePentagon:
 		r.fillPentagon(x, y, w, h, fc)
 	case AutoShapeArrowRight:
@@ -585,6 +980,20 @@ func (r *renderer) renderAutoShapeFill(s *AutoShape, x, y, w, h int) {
 		r.fillHeart(x, y, w, h, fc)
 	case AutoShapePlus:
 		r.fillPlus(x, y, w, h, fc)
+	case AutoShapeChevron:
+		r.fillChevron(x, y, w, h, fc)
+	case AutoShapeParallelogram:
+		r.fillParallelogram(x, y, w, h, fc)
+	case AutoShapeLeftRightArrow:
+		r.fillLeftRightArrow(x, y, w, h, fc)
+	case AutoShapeRtTriangle:
+		r.fillRtTriangle(x, y, w, h, fc)
+	case AutoShapeHomePlate:
+		r.fillHomePlate(x, y, w, h, fc)
+	case AutoShapeUturnArrow:
+		r.fillUturnArrow(x, y, w, h, fc, s.adjustValues)
+	case AutoShapeBentArrow:
+		r.fillBentArrow(x, y, w, h, fc, s.adjustValues)
 	default:
 		r.renderFill(s.fill, rect)
 	}
@@ -595,7 +1004,7 @@ func (r *renderer) renderAutoShapeBorder(s *AutoShape, x, y, w, h int) {
 		return
 	}
 	bc := argbToRGBA(s.border.Color)
-	pw := maxInt(int(float64(maxInt(s.border.Width, 1))*r.scaleX), 1)
+	pw := maxInt(int(float64(maxInt(s.border.Width, 1))*12700.0*r.scaleX), 1)
 
 	switch s.shapeType {
 	case AutoShapeEllipse:
@@ -606,18 +1015,650 @@ func (r *renderer) renderAutoShapeBorder(s *AutoShape, x, y, w, h int) {
 		r.drawTriangle(x, y, w, h, bc, pw)
 	case AutoShapeDiamond:
 		r.drawDiamond(x, y, w, h, bc, pw)
+	case AutoShapeFlowchartPreparation:
+		pts := regularPolygonPoints(x, y, w, h, 6, 0)
+		r.drawPolygon(pts, bc, pw)
+	case AutoShapeChevron:
+		notch := w / 4
+		pts := []fpoint{
+			{float64(x), float64(y)},
+			{float64(x + w - notch), float64(y)},
+			{float64(x + w), float64(y + h/2)},
+			{float64(x + w - notch), float64(y + h)},
+			{float64(x), float64(y + h)},
+			{float64(x + notch), float64(y + h/2)},
+		}
+		r.drawPolygon(pts, bc, pw)
+	case AutoShapeParallelogram:
+		offset := w / 4
+		pts := []fpoint{
+			{float64(x + offset), float64(y)},
+			{float64(x + w), float64(y)},
+			{float64(x + w - offset), float64(y + h)},
+			{float64(x), float64(y + h)},
+		}
+		r.drawPolygon(pts, bc, pw)
+	case AutoShapeBentArrow:
+		// Draw border following the bentArrow shape outline
+		adj1v, adj2v, adj3v, adj4v := 25000, 25000, 25000, 43750
+		if s.adjustValues != nil {
+			if v, ok := s.adjustValues["adj1"]; ok {
+				adj1v = v
+			}
+			if v, ok := s.adjustValues["adj2"]; ok {
+				adj2v = v
+			}
+			if v, ok := s.adjustValues["adj3"]; ok {
+				adj3v = v
+			}
+			if v, ok := s.adjustValues["adj4"]; ok {
+				adj4v = v
+			}
+		}
+		fx, fy := float64(x), float64(y)
+		fw, fh := float64(w), float64(h)
+		shaftW := fw * float64(adj1v) / 100000.0
+		headExtra := fw * float64(adj2v) / 100000.0
+		headLen := fw * float64(adj3v) / 100000.0
+		bendYf := fy + fh*float64(adj4v)/100000.0
+		tipX := fx + fw
+		arrowCenterY := bendYf - shaftW/2
+		arrowBaseX := tipX - headLen
+		arrowTop := arrowCenterY - shaftW/2 - headExtra
+		arrowBot := arrowCenterY + shaftW/2 + headExtra
+		cornerR := shaftW * 0.85
+		if cornerR < 1 {
+			cornerR = 1
+		}
+		bpts := []fpoint{{fx, fy + fh}}
+		// Outer corner arc
+		outerR := cornerR
+		maxOR := math.Min(bendYf-shaftW-fy, fw*0.3)
+		if outerR > maxOR && maxOR > 0 {
+			outerR = maxOR
+		}
+		ocx := fx + outerR
+		ocy := bendYf - shaftW + outerR
+		bpts = append(bpts, fpoint{fx, ocy})
+		for i := 0; i <= 12; i++ {
+			t := float64(i) / 12.0
+			a := math.Pi + t*math.Pi/2.0
+			bpts = append(bpts, fpoint{ocx + outerR*math.Cos(a), ocy + outerR*math.Sin(a)})
+		}
+		bpts = append(bpts,
+			fpoint{arrowBaseX, bendYf - shaftW},
+			fpoint{arrowBaseX, arrowTop},
+			fpoint{tipX, arrowCenterY},
+			fpoint{arrowBaseX, arrowBot},
+			fpoint{arrowBaseX, bendYf},
+		)
+		// Inner corner arc
+		innerR := cornerR
+		maxIR := math.Min(fh-fh*float64(adj4v)/100000.0, shaftW*0.9)
+		if innerR > maxIR && maxIR > 0 {
+			innerR = maxIR
+		}
+		icx := fx + shaftW + innerR
+		icy := bendYf + innerR
+		bpts = append(bpts, fpoint{icx, bendYf})
+		for i := 0; i <= 12; i++ {
+			t := float64(i) / 12.0
+			a := math.Pi/2.0 + t*math.Pi/2.0
+			bpts = append(bpts, fpoint{icx + innerR*math.Cos(a), icy - innerR*math.Sin(a)})
+		}
+		bpts = append(bpts, fpoint{fx + shaftW, fy + fh})
+		r.drawPolygon(bpts, bc, pw)
+	case AutoShapeRtTriangle:
+		pts := []fpoint{
+			{float64(x), float64(y + h)},
+			{float64(x), float64(y)},
+			{float64(x + w), float64(y + h)},
+		}
+		r.drawPolygon(pts, bc, pw)
 	default:
 		r.drawRectBorder(image.Rect(x, y, x+w, y+h), bc, pw, s.border.Style)
 	}
 }
 
 func (r *renderer) renderLine(s *LineShape) {
-	x1 := r.emuToPixelX(s.offsetX)
-	y1 := r.emuToPixelY(s.offsetY)
-	x2 := r.emuToPixelX(s.offsetX + s.width)
-	y2 := r.emuToPixelY(s.offsetY + s.height)
-	pw := maxInt(int(float64(maxInt(s.lineWidth, 1))*r.scaleX), 1)
-	r.drawLineAA(x1, y1, x2, y2, argbToRGBA(s.lineColor), pw)
+	rotation := s.GetRotation()
+	if rotation != 0 {
+		// For rotated connectors, compute the path in local coordinates,
+		// apply flip and rotation transforms, then draw on the main canvas.
+		r.renderLineRotated(s)
+		return
+	}
+	ox := r.emuToPixelX(s.offsetX)
+	oy := r.emuToPixelY(s.offsetY)
+	r.renderLineAt(s, ox, oy)
+}
+
+// renderLineRotated handles connectors with rotation by transforming path points.
+func (r *renderer) renderLineRotated(s *LineShape) {
+	w := r.emuToPixelX(s.width)
+	h := r.emuToPixelY(s.height)
+	ox := r.emuToPixelX(s.offsetX)
+	oy := r.emuToPixelY(s.offsetY)
+	rotation := s.GetRotation()
+
+	// Build path in local coordinates (0,0)-(w,h), no flip applied yet
+	var pathPts [][2]int
+	x1, y1, x2, y2 := 0, 0, w, h
+
+	switch {
+	case s.connectorType == "bentConnector3":
+		adjPct := 50000
+		if v, ok := s.adjustValues["adj1"]; ok {
+			adjPct = v
+		}
+		midX := x1 + int(float64(x2-x1)*float64(adjPct)/100000.0)
+		pathPts = [][2]int{{x1, y1}, {midX, y1}, {midX, y2}, {x2, y2}}
+
+	case s.connectorType == "bentConnector2":
+		pathPts = [][2]int{{x1, y1}, {x2, y1}, {x2, y2}}
+
+	case s.connectorType == "bentConnector4":
+		adjPct1 := 50000
+		adjPct2 := 50000
+		if v, ok := s.adjustValues["adj1"]; ok {
+			adjPct1 = v
+		}
+		if v, ok := s.adjustValues["adj2"]; ok {
+			adjPct2 = v
+		}
+		midX := x1 + int(float64(x2-x1)*float64(adjPct1)/100000.0)
+		midY := y1 + int(float64(y2-y1)*float64(adjPct2)/100000.0)
+		pathPts = [][2]int{{x1, y1}, {midX, y1}, {midX, midY}, {x2, midY}, {x2, y2}}
+
+	case s.connectorType == "bentConnector5":
+		adjPct1 := 50000
+		adjPct2 := 50000
+		adjPct3 := 50000
+		if v, ok := s.adjustValues["adj1"]; ok {
+			adjPct1 = v
+		}
+		if v, ok := s.adjustValues["adj2"]; ok {
+			adjPct2 = v
+		}
+		if v, ok := s.adjustValues["adj3"]; ok {
+			adjPct3 = v
+		}
+		midX1 := x1 + int(float64(x2-x1)*float64(adjPct1)/100000.0)
+		midY := y1 + int(float64(y2-y1)*float64(adjPct2)/100000.0)
+		midX2 := x1 + int(float64(x2-x1)*float64(adjPct3)/100000.0)
+		pathPts = [][2]int{{x1, y1}, {midX1, y1}, {midX1, midY}, {midX2, midY}, {midX2, y2}, {x2, y2}}
+
+	default:
+		// Straight line
+		pathPts = [][2]int{{x1, y1}, {x2, y2}}
+	}
+
+	// Apply flips in local coordinates
+	if s.flipHorizontal {
+		for i := range pathPts {
+			pathPts[i][0] = w - pathPts[i][0]
+		}
+	}
+	if s.flipVertical {
+		for i := range pathPts {
+			pathPts[i][1] = h - pathPts[i][1]
+		}
+	}
+
+	// Rotate each point around the center of the bounding box
+	cx := float64(w) / 2.0
+	cy := float64(h) / 2.0
+	rad := float64(rotation) * math.Pi / 180.0
+	cosA := math.Cos(rad)
+	sinA := math.Sin(rad)
+
+	// The destination center on the slide
+	destCX := float64(ox) + cx
+	destCY := float64(oy) + cy
+
+	transformed := make([][2]int, len(pathPts))
+	for i, pt := range pathPts {
+		// Translate to center-relative
+		rx := float64(pt[0]) - cx
+		ry := float64(pt[1]) - cy
+		// Rotate (clockwise in screen coords: same as renderRotated forward transform)
+		nx := rx*cosA - ry*sinA
+		ny := rx*sinA + ry*cosA
+		// Translate to slide coordinates
+		transformed[i] = [2]int{
+			int(math.Round(nx + destCX)),
+			int(math.Round(ny + destCY)),
+		}
+	}
+
+	pw := maxInt(int(float64(maxInt(s.lineWidth, 1))*12700.0*r.scaleX), 1)
+	c := argbToRGBA(s.lineColor)
+
+	// Draw the transformed path segments
+	for i := 0; i+1 < len(transformed); i++ {
+		r.drawLineAA(transformed[i][0], transformed[i][1],
+			transformed[i+1][0], transformed[i+1][1], c, pw)
+	}
+
+	// Draw arrows using the transformed path
+	// headEnd at the first point, tailEnd at the last point
+	if s.headEnd != nil && s.headEnd.Type != ArrowNone && s.headEnd.Type != "" {
+		r.drawArrowOnPath(transformed[0][0], transformed[0][1], transformed, c, pw, s.headEnd)
+	}
+	if s.tailEnd != nil && s.tailEnd.Type != ArrowNone && s.tailEnd.Type != "" {
+		last := transformed[len(transformed)-1]
+		r.drawArrowOnPath(last[0], last[1], transformed, c, pw, s.tailEnd)
+	}
+}
+
+
+// renderLineAt draws a line/connector with the bounding box top-left at (ox, oy).
+// Flip and adjust values are applied relative to this origin.
+func (r *renderer) renderLineAt(s *LineShape, ox, oy int) {
+	w := r.emuToPixelX(s.width)
+	h := r.emuToPixelY(s.height)
+
+	// Visual start/end (after flip) — headEnd is at visual start (x1,y1),
+	// tailEnd is at visual end (x2,y2). Flip attributes determine which
+	// geometric corner maps to the visual start/end.
+	gx1 := ox
+	gy1 := oy
+	gx2 := ox + w
+	gy2 := oy + h
+
+	x1, y1, x2, y2 := gx1, gy1, gx2, gy2
+	if s.flipHorizontal {
+		x1, x2 = x2, x1
+	}
+	if s.flipVertical {
+		y1, y2 = y2, y1
+	}
+	// lineWidth is in points (EMU / 12700), convert back to EMU then to pixels
+	pw := maxInt(int(float64(maxInt(s.lineWidth, 1))*12700.0*r.scaleX), 1)
+	c := argbToRGBA(s.lineColor)
+
+	// drawSeg draws a line segment respecting the connector's dash style.
+	ls := s.lineStyle
+	drawSeg := func(ax, ay, bx, by int) {
+		if ls == BorderDash || ls == BorderDot {
+			r.drawDashedLineAA(ax, ay, bx, by, c, pw, ls)
+		} else {
+			r.drawLineAA(ax, ay, bx, by, c, pw)
+		}
+	}
+
+	switch {
+	case s.connectorType == "bentConnector3":
+		// Elbow connector with 3 segments: horizontal, vertical, horizontal
+		adjPct := 50000
+		if v, ok := s.adjustValues["adj1"]; ok {
+			adjPct = v
+		}
+		midX := x1 + int(float64(x2-x1)*float64(adjPct)/100000.0)
+		drawSeg(x1, y1, midX, y1)
+		drawSeg(midX, y1, midX, y2)
+		drawSeg(midX, y2, x2, y2)
+		pathPts := [][2]int{{x1, y1}, {midX, y1}, {midX, y2}, {x2, y2}}
+		if s.headEnd != nil && s.headEnd.Type != ArrowNone && s.headEnd.Type != "" {
+			r.drawArrowOnPath(x1, y1, pathPts, c, pw, s.headEnd)
+		}
+		if s.tailEnd != nil && s.tailEnd.Type != ArrowNone && s.tailEnd.Type != "" {
+			r.drawArrowOnPath(x2, y2, pathPts, c, pw, s.tailEnd)
+		}
+
+	case s.connectorType == "bentConnector2":
+		drawSeg(x1, y1, x2, y1)
+		drawSeg(x2, y1, x2, y2)
+		pathPts := [][2]int{{x1, y1}, {x2, y1}, {x2, y2}}
+		if s.headEnd != nil && s.headEnd.Type != ArrowNone && s.headEnd.Type != "" {
+			r.drawArrowOnPath(x1, y1, pathPts, c, pw, s.headEnd)
+		}
+		if s.tailEnd != nil && s.tailEnd.Type != ArrowNone && s.tailEnd.Type != "" {
+			r.drawArrowOnPath(x2, y2, pathPts, c, pw, s.tailEnd)
+		}
+
+	case s.connectorType == "bentConnector4":
+		adjPct1 := 50000
+		adjPct2 := 50000
+		if v, ok := s.adjustValues["adj1"]; ok {
+			adjPct1 = v
+		}
+		if v, ok := s.adjustValues["adj2"]; ok {
+			adjPct2 = v
+		}
+		midX := x1 + int(float64(x2-x1)*float64(adjPct1)/100000.0)
+		midY := y1 + int(float64(y2-y1)*float64(adjPct2)/100000.0)
+		drawSeg(x1, y1, midX, y1)
+		drawSeg(midX, y1, midX, midY)
+		drawSeg(midX, midY, x2, midY)
+		drawSeg(x2, midY, x2, y2)
+		pathPts := [][2]int{{x1, y1}, {midX, y1}, {midX, midY}, {x2, midY}, {x2, y2}}
+		if s.headEnd != nil && s.headEnd.Type != ArrowNone && s.headEnd.Type != "" {
+			r.drawArrowOnPath(x1, y1, pathPts, c, pw, s.headEnd)
+		}
+		if s.tailEnd != nil && s.tailEnd.Type != ArrowNone && s.tailEnd.Type != "" {
+			r.drawArrowOnPath(x2, y2, pathPts, c, pw, s.tailEnd)
+		}
+
+	case s.connectorType == "bentConnector5":
+		adjPct1 := 50000
+		adjPct2 := 50000
+		adjPct3 := 50000
+		if v, ok := s.adjustValues["adj1"]; ok {
+			adjPct1 = v
+		}
+		if v, ok := s.adjustValues["adj2"]; ok {
+			adjPct2 = v
+		}
+		if v, ok := s.adjustValues["adj3"]; ok {
+			adjPct3 = v
+		}
+		midX1 := x1 + int(float64(x2-x1)*float64(adjPct1)/100000.0)
+		midY := y1 + int(float64(y2-y1)*float64(adjPct2)/100000.0)
+		midX2 := x1 + int(float64(x2-x1)*float64(adjPct3)/100000.0)
+		drawSeg(x1, y1, midX1, y1)
+		drawSeg(midX1, y1, midX1, midY)
+		drawSeg(midX1, midY, midX2, midY)
+		drawSeg(midX2, midY, midX2, y2)
+		drawSeg(midX2, y2, x2, y2)
+		pathPts := [][2]int{{x1, y1}, {midX1, y1}, {midX1, midY}, {midX2, midY}, {midX2, y2}, {x2, y2}}
+		if s.headEnd != nil && s.headEnd.Type != ArrowNone && s.headEnd.Type != "" {
+			r.drawArrowOnPath(x1, y1, pathPts, c, pw, s.headEnd)
+		}
+		if s.tailEnd != nil && s.tailEnd.Type != ArrowNone && s.tailEnd.Type != "" {
+			r.drawArrowOnPath(x2, y2, pathPts, c, pw, s.tailEnd)
+		}
+
+	case strings.HasPrefix(s.connectorType, "curvedConnector"):
+		r.renderCurvedConnector(s.connectorType, x1, y1, x2, y2, s.adjustValues, c, pw, ls, s.headEnd, s.tailEnd)
+
+	default:
+		// Straight line connector (line, straightConnector1, etc.)
+		drawSeg(x1, y1, x2, y2)
+		// headEnd at visual start (x1,y1), tailEnd at visual end (x2,y2).
+		// Arrow tip placed at the endpoint, direction from the other end.
+		if s.headEnd != nil && s.headEnd.Type != ArrowNone && s.headEnd.Type != "" {
+			r.drawArrowHead(x2, y2, x1, y1, c, pw, s.headEnd, false)
+		}
+		if s.tailEnd != nil && s.tailEnd.Type != ArrowNone && s.tailEnd.Type != "" {
+			r.drawArrowHead(x1, y1, x2, y2, c, pw, s.tailEnd, false)
+		}
+	}
+}
+
+// renderCurvedConnector draws a curved connector using cubic Bezier curves.
+// OOXML curved connectors (curvedConnector2..5) follow the same waypoint
+// logic as bent connectors but replace the right-angle segments with smooth
+// S-curves through the waypoints.
+func (r *renderer) renderCurvedConnector(connType string, x1, y1, x2, y2 int, adj map[string]int, c color.RGBA, pw int, ls BorderStyle, headEnd, tailEnd *LineEnd) {
+	drawBezier := func(bx0, by0, bx1, by1, bx2, by2, bx3, by3 float64) {
+		if ls == BorderDash || ls == BorderDot {
+			r.drawDashedCubicBezierAA(bx0, by0, bx1, by1, bx2, by2, bx3, by3, c, pw, ls)
+		} else {
+			r.drawCubicBezierAA(bx0, by0, bx1, by1, bx2, by2, bx3, by3, c, pw)
+		}
+	}
+
+	// Build waypoints based on connector type (same as bent connectors)
+	var waypoints []fpoint
+	switch connType {
+	case "curvedConnector2":
+		waypoints = []fpoint{{float64(x1), float64(y1)}, {float64(x2), float64(y1)}, {float64(x2), float64(y2)}}
+	case "curvedConnector3":
+		adjPct := 50000
+		if v, ok := adj["adj1"]; ok {
+			adjPct = v
+		}
+		midX := float64(x1) + float64(x2-x1)*float64(adjPct)/100000.0
+		waypoints = []fpoint{{float64(x1), float64(y1)}, {midX, float64(y1)}, {midX, float64(y2)}, {float64(x2), float64(y2)}}
+	case "curvedConnector4":
+		adjPct1 := 50000
+		adjPct2 := 50000
+		if v, ok := adj["adj1"]; ok {
+			adjPct1 = v
+		}
+		if v, ok := adj["adj2"]; ok {
+			adjPct2 = v
+		}
+		midX := float64(x1) + float64(x2-x1)*float64(adjPct1)/100000.0
+		midY := float64(y1) + float64(y2-y1)*float64(adjPct2)/100000.0
+		waypoints = []fpoint{{float64(x1), float64(y1)}, {midX, float64(y1)}, {midX, midY}, {float64(x2), midY}, {float64(x2), float64(y2)}}
+	case "curvedConnector5":
+		adjPct1 := 50000
+		adjPct2 := 50000
+		adjPct3 := 50000
+		if v, ok := adj["adj1"]; ok {
+			adjPct1 = v
+		}
+		if v, ok := adj["adj2"]; ok {
+			adjPct2 = v
+		}
+		if v, ok := adj["adj3"]; ok {
+			adjPct3 = v
+		}
+		midX1 := float64(x1) + float64(x2-x1)*float64(adjPct1)/100000.0
+		midY := float64(y1) + float64(y2-y1)*float64(adjPct2)/100000.0
+		midX2 := float64(x1) + float64(x2-x1)*float64(adjPct3)/100000.0
+		waypoints = []fpoint{{float64(x1), float64(y1)}, {midX1, float64(y1)}, {midX1, midY}, {midX2, midY}, {midX2, float64(y2)}, {float64(x2), float64(y2)}}
+	default:
+		// Unknown curved connector variant, draw as straight
+		waypoints = []fpoint{{float64(x1), float64(y1)}, {float64(x2), float64(y2)}}
+	}
+
+	if len(waypoints) < 2 {
+		return
+	}
+
+	// Draw smooth curves through waypoints using cubic Bezier segments.
+	// Each pair of consecutive waypoints becomes a Bezier segment where
+	// the control points create a smooth S-curve between the two points.
+	for i := 0; i < len(waypoints)-1; i++ {
+		p0 := waypoints[i]
+		p1 := waypoints[i+1]
+		// Control points at 1/3 and 2/3 along the segment, but shifted
+		// to create the S-curve effect (horizontal→vertical or vertical→horizontal)
+		dx := p1.x - p0.x
+		dy := p1.y - p0.y
+		if math.Abs(dx) > math.Abs(dy) {
+			// Primarily horizontal segment: curve vertically at midpoint
+			drawBezier(p0.x, p0.y, p0.x+dx/2, p0.y, p0.x+dx/2, p1.y, p1.x, p1.y)
+		} else {
+			// Primarily vertical segment: curve horizontally at midpoint
+			drawBezier(p0.x, p0.y, p0.x, p0.y+dy/2, p1.x, p0.y+dy/2, p1.x, p1.y)
+		}
+	}
+
+	// Draw arrow heads using the tangent direction at the endpoints
+	if headEnd != nil && headEnd.Type != ArrowNone && headEnd.Type != "" {
+		// Direction from second waypoint toward first
+		p0 := waypoints[0]
+		p1 := waypoints[1]
+		dx := p1.x - p0.x
+		dy := p1.y - p0.y
+		// Tangent at start: for our Bezier, the initial tangent points toward the first control point
+		var fromX, fromY int
+		if math.Abs(dx) > math.Abs(dy) {
+			fromX = int(p0.x + dx/2)
+			fromY = int(p0.y)
+		} else {
+			fromX = int(p0.x)
+			fromY = int(p0.y + dy/2)
+		}
+		r.drawArrowHead(fromX, fromY, int(p0.x), int(p0.y), c, pw, headEnd, false)
+	}
+	if tailEnd != nil && tailEnd.Type != ArrowNone && tailEnd.Type != "" {
+		n := len(waypoints)
+		pLast := waypoints[n-1]
+		pPrev := waypoints[n-2]
+		dx := pLast.x - pPrev.x
+		dy := pLast.y - pPrev.y
+		var fromX, fromY int
+		if math.Abs(dx) > math.Abs(dy) {
+			fromX = int(pPrev.x + dx/2)
+			fromY = int(pLast.y)
+		} else {
+			fromX = int(pLast.x)
+			fromY = int(pPrev.y + dy/2)
+		}
+		r.drawArrowHead(fromX, fromY, int(pLast.x), int(pLast.y), c, pw, tailEnd, false)
+	}
+}
+
+
+// drawArrowOnPath draws an arrow at the visual endpoint (vx,vy) using the
+// direction from the visual path. It finds which end of the path is closest to
+// the visual point and uses the appropriate segment for direction.
+func (r *renderer) drawArrowOnPath(vx, vy int, pathPts [][2]int, c color.RGBA, lineWidth int, le *LineEnd) {
+	if len(pathPts) < 2 {
+		return
+	}
+	first := pathPts[0]
+	last := pathPts[len(pathPts)-1]
+	distFirst := abs(vx-first[0]) + abs(vy-first[1])
+	distLast := abs(vx-last[0]) + abs(vy-last[1])
+
+	if distFirst <= distLast {
+		// Visual point is at the start of the path.
+		// Find first non-zero-length segment for direction.
+		for i := 0; i+1 < len(pathPts); i++ {
+			dx := pathPts[i+1][0] - pathPts[i][0]
+			dy := pathPts[i+1][1] - pathPts[i][1]
+			if abs(dx) > 1 || abs(dy) > 1 {
+				r.drawArrowHead(pathPts[i+1][0], pathPts[i+1][1], vx, vy, c, lineWidth, le, false)
+				return
+			}
+		}
+		r.drawArrowHead(last[0], last[1], vx, vy, c, lineWidth, le, false)
+	} else {
+		// Visual point is at the end of the path.
+		// Find last non-zero-length segment for direction.
+		for i := len(pathPts) - 1; i > 0; i-- {
+			dx := pathPts[i][0] - pathPts[i-1][0]
+			dy := pathPts[i][1] - pathPts[i-1][1]
+			if abs(dx) > 1 || abs(dy) > 1 {
+				r.drawArrowHead(pathPts[i-1][0], pathPts[i-1][1], vx, vy, c, lineWidth, le, false)
+				return
+			}
+		}
+		r.drawArrowHead(first[0], first[1], vx, vy, c, lineWidth, le, false)
+	}
+}
+
+// drawArrowHead draws an arrow head at one end of a line.
+// If atStart is true, the arrow is drawn at (x1,y1) pointing away from (x2,y2).
+// If atStart is false, the arrow is drawn at (x2,y2) pointing away from (x1,y1).
+func (r *renderer) drawArrowHead(x1, y1, x2, y2 int, c color.RGBA, lineWidth int, le *LineEnd, atStart bool) {
+	// Compute arrow size based on line width and arrow size attributes.
+	// PowerPoint arrow sizing: the OOXML spec defines arrow length/width in
+	// terms of line width multiples. For "med" size on a 2pt line at 96 DPI:
+	//   length ≈ 9px, width ≈ 7px
+	// We use a formula that matches PowerPoint's rendering closely.
+	lw := float64(lineWidth)
+	baseLen := lw*3.0 + 4.0
+	baseWidth := lw*2.5 + 3.0
+
+	switch le.Length {
+	case ArrowSizeSm:
+		baseLen *= 0.6
+	case ArrowSizeLg:
+		baseLen *= 1.6
+	}
+	switch le.Width {
+	case ArrowSizeSm:
+		baseWidth *= 0.6
+	case ArrowSizeLg:
+		baseWidth *= 1.6
+	}
+
+	// Minimum arrow size for visibility
+	if baseLen < 7 {
+		baseLen = 7
+	}
+	if baseWidth < 5 {
+		baseWidth = 5
+	}
+
+	// Direction vector
+	var dx, dy float64
+	if atStart {
+		dx = float64(x1 - x2)
+		dy = float64(y1 - y2)
+	} else {
+		dx = float64(x2 - x1)
+		dy = float64(y2 - y1)
+	}
+	length := math.Sqrt(dx*dx + dy*dy)
+	if length < 1 {
+		return
+	}
+	dx /= length
+	dy /= length
+
+	// Tip point — extend 0.5px past the endpoint so the scanline at the
+	// endpoint row hits the very tip of the triangle (the scanline samples
+	// at pixel-center y+0.5, so without this offset the tip row is already
+	// past the vertex and produces a flat bottom instead of a sharp point).
+	var tipX, tipY float64
+	if atStart {
+		tipX = float64(x1) + dx*0.5
+		tipY = float64(y1) + dy*0.5
+	} else {
+		tipX = float64(x2) + dx*0.5
+		tipY = float64(y2) + dy*0.5
+	}
+
+	// Base center (behind the tip)
+	baseX := tipX - dx*baseLen
+	baseY := tipY - dy*baseLen
+
+	// Perpendicular
+	perpX := -dy
+	perpY := dx
+
+	halfW := baseWidth / 2.0
+
+	switch le.Type {
+	case ArrowTriangle:
+		// Filled triangle arrow head
+		p1 := fpoint{tipX, tipY}
+		p2 := fpoint{baseX + perpX*halfW, baseY + perpY*halfW}
+		p3 := fpoint{baseX - perpX*halfW, baseY - perpY*halfW}
+		pts := []fpoint{p1, p2, p3}
+		r.fillPolygon(pts, c)
+	case ArrowStealth:
+		// Stealth has a notch at the base
+		p1 := fpoint{tipX, tipY}
+		p2 := fpoint{baseX + perpX*halfW, baseY + perpY*halfW}
+		p3 := fpoint{baseX - perpX*halfW, baseY - perpY*halfW}
+		notchDepth := baseLen * 0.3
+		notchX := baseX + dx*notchDepth
+		notchY := baseY + dy*notchDepth
+		pts := []fpoint{p1, p2, {notchX, notchY}, p3}
+		r.fillPolygon(pts, c)
+	case ArrowArrow:
+		// Open arrow head — two lines forming a V (not filled)
+		p2 := fpoint{baseX + perpX*halfW, baseY + perpY*halfW}
+		p3 := fpoint{baseX - perpX*halfW, baseY - perpY*halfW}
+		lw := maxInt(lineWidth, 1)
+		r.drawLineAA(int(p2.x), int(p2.y), int(tipX), int(tipY), c, lw)
+		r.drawLineAA(int(tipX), int(tipY), int(p3.x), int(p3.y), c, lw)
+	case ArrowDiamond:
+		// Diamond shape
+		midX := tipX - dx*baseLen/2
+		midY := tipY - dy*baseLen/2
+		p1 := fpoint{tipX, tipY}
+		p2 := fpoint{midX + perpX*halfW, midY + perpY*halfW}
+		p3 := fpoint{baseX, baseY}
+		p4 := fpoint{midX - perpX*halfW, midY - perpY*halfW}
+		pts := []fpoint{p1, p2, p3, p4}
+		r.fillPolygon(pts, c)
+	case ArrowOval:
+		// Oval/circle at the end
+		cx := int(tipX - dx*baseLen/2)
+		cy := int(tipY - dy*baseLen/2)
+		rad := int(baseLen / 2)
+		r.fillEllipseAA(cx-rad, cy-rad, rad*2, rad*2, c)
+	}
 }
 
 func (r *renderer) renderTable(s *TableShape) {
@@ -628,33 +1669,83 @@ func (r *renderer) renderTable(s *TableShape) {
 	if s.numRows == 0 || s.numCols == 0 {
 		return
 	}
-	cellW := w / s.numCols
-	cellH := h / s.numRows
+
+	// Compute column positions using individual widths if available
+	colX := make([]int, s.numCols+1)
+	colX[0] = x
+	if len(s.colWidths) == s.numCols {
+		for i, cw := range s.colWidths {
+			colX[i+1] = colX[i] + r.emuToPixelX(cw)
+		}
+	} else {
+		cellW := w / s.numCols
+		for i := 0; i <= s.numCols; i++ {
+			colX[i] = x + i*cellW
+		}
+	}
+
+	// Compute row positions using individual heights if available
+	rowY := make([]int, s.numRows+1)
+	rowY[0] = y
+	if len(s.rowHeights) == s.numRows {
+		for i, rh := range s.rowHeights {
+			rowY[i+1] = rowY[i] + r.emuToPixelY(rh)
+		}
+	} else {
+		cellH := h / s.numRows
+		for i := 0; i <= s.numRows; i++ {
+			rowY[i] = y + i*cellH
+		}
+	}
+
 	pad := 3
 
 	for row := 0; row < s.numRows; row++ {
-		for col := 0; col < s.numCols; col++ {
-			cx := x + col*cellW
-			cy := y + row*cellH
-			cellRect := image.Rect(cx, cy, cx+cellW, cy+cellH)
+		if row >= len(s.rows) {
+			break
+		}
+		for col := 0; col < len(s.rows[row]); col++ {
+			if col >= s.numCols {
+				break
+			}
 			cell := s.rows[row][col]
+			// Skip merged continuation cells
+			if cell.hMerge || cell.vMerge {
+				continue
+			}
+			cx := colX[col]
+			cy := rowY[row]
+			// Handle column span
+			endCol := col + cell.colSpan
+			if endCol > s.numCols {
+				endCol = s.numCols
+			}
+			// Handle row span
+			endRow := row + cell.rowSpan
+			if endRow > s.numRows {
+				endRow = s.numRows
+			}
+			cellW := colX[endCol] - cx
+			cellH := rowY[endRow] - cy
+			cellRect := image.Rect(cx, cy, cx+cellW, cy+cellH)
 			r.renderFill(cell.fill, cellRect)
 			if cell.border != nil {
 				r.renderCellBorders(cell.border, cellRect)
 			} else {
 				r.drawRect(cellRect, color.RGBA{A: 255}, 1)
 			}
-			r.drawParagraphs(cell.paragraphs, cx+pad, cy+pad, cellW-2*pad, cellH-2*pad, TextAnchorNone)
+			r.drawParagraphs(cell.paragraphs, cx+pad, cy+pad, cellW-2*pad, cellH-2*pad, TextAnchorNone, true)
 		}
 	}
 }
+
 
 func (r *renderer) renderCellBorders(cb *CellBorders, rect image.Rectangle) {
 	drawBorder := func(b *Border, x1, y1, x2, y2 int) {
 		if b == nil || b.Style == BorderNone {
 			return
 		}
-		pw := maxInt(int(float64(b.Width)*r.scaleX), 1)
+		pw := maxInt(int(float64(b.Width)*12700.0*r.scaleX), 1)
 		r.drawLineThick(x1, y1, x2, y2, argbToRGBA(b.Color), pw)
 	}
 	drawBorder(cb.Top, rect.Min.X, rect.Min.Y, rect.Max.X, rect.Min.Y)
@@ -672,12 +1763,95 @@ func (r *renderer) renderFill(fill *Fill, rect image.Rectangle) {
 	switch fill.Type {
 	case FillSolid:
 		fc := argbToRGBA(fill.Color)
+		fc = r.scaleAlpha(fc)
 		r.fillRectBlend(rect, fc)
 	case FillGradientLinear:
 		r.fillGradientLinear(rect, fill)
 	case FillGradientPath:
 		r.fillGradientPath(rect, fill)
 	}
+}
+
+// renderCustomPathFill fills a custom geometry path within the given shape bounds.
+func (r *renderer) renderCustomPathFill(cp *CustomGeomPath, fill *Fill, ox, oy, w, h int) {
+	if fill == nil || fill.Type == FillNone || cp == nil || len(cp.Commands) == 0 {
+		return
+	}
+	// Convert path coordinates to pixel coordinates
+	pts := r.customPathToPixelPoints(cp, ox, oy, w, h)
+	if len(pts) < 3 {
+		return
+	}
+	fc := argbToRGBA(fill.Color)
+	fc = r.scaleAlpha(fc)
+	r.fillPolygon(pts, fc)
+}
+
+// customPathToPixelPoints converts a custom geometry path to pixel-space fpoints.
+func (r *renderer) customPathToPixelPoints(cp *CustomGeomPath, ox, oy, w, h int) []fpoint {
+	if cp.Width <= 0 || cp.Height <= 0 {
+		return nil
+	}
+	scX := float64(w) / float64(cp.Width)
+	scY := float64(h) / float64(cp.Height)
+
+	toPixel := func(p PathPoint) fpoint {
+		return fpoint{float64(ox) + float64(p.X)*scX, float64(oy) + float64(p.Y)*scY}
+	}
+
+	var pts []fpoint
+	var lastPt fpoint
+	for _, cmd := range cp.Commands {
+		switch cmd.Type {
+		case "moveTo", "lnTo":
+			if len(cmd.Pts) > 0 {
+				p := toPixel(cmd.Pts[0])
+				pts = append(pts, p)
+				lastPt = p
+			}
+		case "cubicBezTo":
+			// Flatten cubic bezier into line segments for accurate curves
+			if len(cmd.Pts) >= 3 {
+				cp1 := toPixel(cmd.Pts[0])
+				cp2 := toPixel(cmd.Pts[1])
+				ep := toPixel(cmd.Pts[2])
+				bezPts := r.flattenCubicBezier(lastPt.x, lastPt.y, cp1.x, cp1.y, cp2.x, cp2.y, ep.x, ep.y, 0)
+				pts = append(pts, bezPts...)
+				pts = append(pts, ep)
+				lastPt = ep
+			}
+		case "quadBezTo":
+			// Flatten quadratic bezier by converting to cubic
+			if len(cmd.Pts) >= 2 {
+				cp1 := toPixel(cmd.Pts[0])
+				ep := toPixel(cmd.Pts[1])
+				// Convert quadratic to cubic: CP1' = P0 + 2/3*(CP-P0), CP2' = EP + 2/3*(CP-EP)
+				c1x := lastPt.x + 2.0/3.0*(cp1.x-lastPt.x)
+				c1y := lastPt.y + 2.0/3.0*(cp1.y-lastPt.y)
+				c2x := ep.x + 2.0/3.0*(cp1.x-ep.x)
+				c2y := ep.y + 2.0/3.0*(cp1.y-ep.y)
+				bezPts := r.flattenCubicBezier(lastPt.x, lastPt.y, c1x, c1y, c2x, c2y, ep.x, ep.y, 0)
+				pts = append(pts, bezPts...)
+				pts = append(pts, ep)
+				lastPt = ep
+			}
+		case "close":
+			// close is implicit in fillPolygon
+		}
+	}
+	return pts
+}
+
+// scaleAlpha applies the overlayOpacityScale to semi-transparent colors.
+func (r *renderer) scaleAlpha(c color.RGBA) color.RGBA {
+	scale := r.overlayOpacityScale
+	if scale <= 0 || scale >= 1.0 {
+		return c
+	}
+	if c.A < 255 && c.A > 0 {
+		c.A = uint8(float64(c.A) * scale)
+	}
+	return c
 }
 
 func (r *renderer) fillGradientLinear(rect image.Rectangle, fill *Fill) {
@@ -948,6 +2122,178 @@ func (r *renderer) drawLineAA(x1, y1, x2, y2 int, c color.RGBA, width int) {
 		oy := offset * ny
 		r.drawLineWu(float64(x1)+ox, float64(y1)+oy, float64(x2)+ox, float64(y2)+oy, c)
 	}
+}
+
+// drawDashedLineAA draws a dashed or dotted anti-aliased line.
+func (r *renderer) drawDashedLineAA(x1, y1, x2, y2 int, c color.RGBA, width int, style BorderStyle) {
+	if style == BorderSolid || style == BorderNone {
+		r.drawLineAA(x1, y1, x2, y2, c, width)
+		return
+	}
+	dx := float64(x2 - x1)
+	dy := float64(y2 - y1)
+	length := math.Sqrt(dx*dx + dy*dy)
+	if length < 1 {
+		r.blendPixel(x1, y1, c)
+		return
+	}
+	dashLen := 12.0
+	gapLen := 6.0
+	if style == BorderDot {
+		dashLen = 3.0
+		gapLen = 3.0
+	}
+	// Scale dash/gap by line width for visual consistency
+	if width > 1 {
+		dashLen *= float64(width) * 0.4
+		gapLen *= float64(width) * 0.4
+	}
+	ux := dx / length
+	uy := dy / length
+	pos := 0.0
+	drawing := true
+	segStart := 0.0
+	for pos < length {
+		segLen := dashLen
+		if !drawing {
+			segLen = gapLen
+		}
+		segEnd := pos + segLen
+		if segEnd > length {
+			segEnd = length
+		}
+		if drawing {
+			sx := x1 + int(ux*segStart)
+			sy := y1 + int(uy*segStart)
+			ex := x1 + int(ux*segEnd)
+			ey := y1 + int(uy*segEnd)
+			r.drawLineAA(sx, sy, ex, ey, c, width)
+		}
+		pos = segEnd
+		segStart = segEnd
+		drawing = !drawing
+	}
+}
+
+// drawDashedPolylineAA draws a dashed/dotted polyline with continuous dash pattern
+// across all segments, so the dash state carries over from one segment to the next.
+func (r *renderer) drawDashedPolylineAA(pts []fpoint, c color.RGBA, width int, style BorderStyle) {
+	if len(pts) < 2 {
+		return
+	}
+	dashLen := 12.0
+	gapLen := 6.0
+	if style == BorderDot {
+		dashLen = 3.0
+		gapLen = 3.0
+	}
+	if width > 1 {
+		dashLen *= float64(width) * 0.4
+		gapLen *= float64(width) * 0.4
+	}
+	drawing := true
+	remain := dashLen // remaining length in current dash/gap phase
+
+	for i := 1; i < len(pts); i++ {
+		sx, sy := pts[i-1].x, pts[i-1].y
+		ex, ey := pts[i].x, pts[i].y
+		dx := ex - sx
+		dy := ey - sy
+		segLen := math.Sqrt(dx*dx + dy*dy)
+		if segLen < 0.5 {
+			continue
+		}
+		ux := dx / segLen
+		uy := dy / segLen
+		pos := 0.0
+		for pos < segLen {
+			step := remain
+			if pos+step > segLen {
+				step = segLen - pos
+			}
+			if drawing {
+				ax := int(sx + ux*pos)
+				ay := int(sy + uy*pos)
+				bx := int(sx + ux*(pos+step))
+				by := int(sy + uy*(pos+step))
+				r.drawLineAA(ax, ay, bx, by, c, width)
+			}
+			pos += step
+			remain -= step
+			if remain <= 0 {
+				drawing = !drawing
+				if drawing {
+					remain = dashLen
+				} else {
+					remain = gapLen
+				}
+			}
+		}
+	}
+}
+
+// drawCubicBezierAA draws a cubic Bezier curve using adaptive subdivision.
+func (r *renderer) drawCubicBezierAA(x0, y0, x1, y1, x2, y2, x3, y3 float64, c color.RGBA, width int) {
+	// Flatten the Bezier into line segments
+	pts := r.flattenCubicBezier(x0, y0, x1, y1, x2, y2, x3, y3, 0)
+	pts = append([]fpoint{{x0, y0}}, pts...)
+	pts = append(pts, fpoint{x3, y3})
+	for i := 1; i < len(pts); i++ {
+		r.drawLineAA(int(pts[i-1].x), int(pts[i-1].y), int(pts[i].x), int(pts[i].y), c, width)
+	}
+}
+
+// drawDashedCubicBezierAA draws a dashed cubic Bezier curve.
+func (r *renderer) drawDashedCubicBezierAA(x0, y0, x1, y1, x2, y2, x3, y3 float64, c color.RGBA, width int, style BorderStyle) {
+	if style == BorderSolid || style == BorderNone {
+		r.drawCubicBezierAA(x0, y0, x1, y1, x2, y2, x3, y3, c, width)
+		return
+	}
+	pts := r.flattenCubicBezier(x0, y0, x1, y1, x2, y2, x3, y3, 0)
+	pts = append([]fpoint{{x0, y0}}, pts...)
+	pts = append(pts, fpoint{x3, y3})
+	for i := 1; i < len(pts); i++ {
+		r.drawDashedLineAA(int(pts[i-1].x), int(pts[i-1].y), int(pts[i].x), int(pts[i].y), c, width, style)
+	}
+}
+
+// flattenCubicBezier recursively subdivides a cubic Bezier into line segments.
+func (r *renderer) flattenCubicBezier(x0, y0, x1, y1, x2, y2, x3, y3 float64, depth int) []fpoint {
+	if depth > 8 {
+		return nil
+	}
+	// Check if the curve is flat enough
+	dx := x3 - x0
+	dy := y3 - y0
+	d := math.Sqrt(dx*dx + dy*dy)
+	if d < 0.5 {
+		return nil
+	}
+	// Distance of control points from the line (x0,y0)-(x3,y3)
+	d1 := math.Abs((x1-x0)*dy-(y1-y0)*dx) / d
+	d2 := math.Abs((x2-x0)*dy-(y2-y0)*dx) / d
+	if d1+d2 < 1.0 {
+		return nil
+	}
+	// Subdivide at t=0.5
+	mx01 := (x0 + x1) / 2
+	my01 := (y0 + y1) / 2
+	mx12 := (x1 + x2) / 2
+	my12 := (y1 + y2) / 2
+	mx23 := (x2 + x3) / 2
+	my23 := (y2 + y3) / 2
+	mx012 := (mx01 + mx12) / 2
+	my012 := (my01 + my12) / 2
+	mx123 := (mx12 + mx23) / 2
+	my123 := (my12 + my23) / 2
+	mx0123 := (mx012 + mx123) / 2
+	my0123 := (my012 + my123) / 2
+
+	left := r.flattenCubicBezier(x0, y0, mx01, my01, mx012, my012, mx0123, my0123, depth+1)
+	right := r.flattenCubicBezier(mx0123, my0123, mx123, my123, mx23, my23, x3, y3, depth+1)
+	result := append(left, fpoint{mx0123, my0123})
+	result = append(result, right...)
+	return result
 }
 
 func (r *renderer) drawLineWu(x0, y0, x1, y1 float64, c color.RGBA) {
@@ -1250,6 +2596,95 @@ func (r *renderer) fillPolygon(pts []fpoint, c color.RGBA) {
 	}
 }
 
+func (r *renderer) fillPolygonGradient(pts []fpoint, fill *Fill) {
+	if len(pts) < 3 || fill == nil {
+		return
+	}
+	startC := argbToRGBA(fill.Color)
+	endC := argbToRGBA(fill.EndColor)
+
+	// Compute bounding box
+	minX, minY, maxX, maxY := pts[0].x, pts[0].y, pts[0].x, pts[0].y
+	for _, p := range pts[1:] {
+		if p.x < minX { minX = p.x }
+		if p.y < minY { minY = p.y }
+		if p.x > maxX { maxX = p.x }
+		if p.y > maxY { maxY = p.y }
+	}
+	bw := maxX - minX
+	bh := maxY - minY
+	if bw <= 0 || bh <= 0 {
+		return
+	}
+
+	rad := float64(fill.Rotation) * math.Pi / 180.0
+	cosA := math.Cos(rad)
+	sinA := math.Sin(rad)
+	cx := bw / 2
+	cy := bh / 2
+	maxProj := math.Abs(cx*cosA) + math.Abs(cy*sinA)
+	if maxProj < 1 {
+		maxProj = 1
+	}
+	invMaxProj := 1.0 / (2 * maxProj)
+
+	n := len(pts)
+	intersections := make([]float64, 0, n)
+	bounds := r.img.Bounds()
+	pix := r.img.Pix
+	stride := r.img.Stride
+
+	for y := int(minY); y <= int(maxY); y++ {
+		if y < bounds.Min.Y || y >= bounds.Max.Y {
+			continue
+		}
+		fy := float64(y) + 0.5
+		intersections = intersections[:0]
+		for i := 0; i < n; i++ {
+			j := (i + 1) % n
+			py1, py2 := pts[i].y, pts[j].y
+			if py1 > py2 {
+				py1, py2 = py2, py1
+			}
+			if fy < py1 || fy >= py2 {
+				continue
+			}
+			dy := pts[j].y - pts[i].y
+			if dy == 0 {
+				continue
+			}
+			t := (fy - pts[i].y) / dy
+			intersections = append(intersections, pts[i].x+t*(pts[j].x-pts[i].x))
+		}
+		sort.Float64s(intersections)
+
+		dyf := float64(y) - minY - cy
+		rowBase := dyf*sinA + maxProj
+
+		for i := 0; i+1 < len(intersections); i += 2 {
+			x1 := int(math.Ceil(intersections[i]))
+			x2 := int(math.Floor(intersections[i+1]))
+			if x1 > x2 {
+				continue
+			}
+			if x1 < bounds.Min.X { x1 = bounds.Min.X }
+			if x2 >= bounds.Max.X { x2 = bounds.Max.X - 1 }
+			off := (y-bounds.Min.Y)*stride + (x1-bounds.Min.X)*4
+			for px := x1; px <= x2; px++ {
+				dxf := float64(px) - minX - cx
+				t := (dxf*cosA + rowBase) * invMaxProj
+				if t < 0 { t = 0 } else if t > 1 { t = 1 }
+				it := 1 - t
+				pix[off] = uint8(float64(startC.R)*it + float64(endC.R)*t)
+				pix[off+1] = uint8(float64(startC.G)*it + float64(endC.G)*t)
+				pix[off+2] = uint8(float64(startC.B)*it + float64(endC.B)*t)
+				pix[off+3] = uint8(float64(startC.A)*it + float64(endC.A)*t)
+				off += 4
+			}
+		}
+	}
+}
+
 func (r *renderer) drawPolygon(pts []fpoint, c color.RGBA, width int) {
 	n := len(pts)
 	for i := 0; i < n; i++ {
@@ -1285,6 +2720,11 @@ func (r *renderer) drawDiamond(x, y, w, h int, c color.RGBA, width int) {
 }
 
 func (r *renderer) fillRegularPolygon(x, y, w, h, sides int, startAngle float64, c color.RGBA) {
+	pts := regularPolygonPoints(x, y, w, h, sides, startAngle)
+	r.fillPolygon(pts, c)
+}
+
+func regularPolygonPoints(x, y, w, h, sides int, startAngle float64) []fpoint {
 	cx := float64(x) + float64(w)/2
 	cy := float64(y) + float64(h)/2
 	rx := float64(w) / 2
@@ -1294,7 +2734,7 @@ func (r *renderer) fillRegularPolygon(x, y, w, h, sides int, startAngle float64,
 		angle := startAngle + float64(i)*2*math.Pi/float64(sides)
 		pts[i] = fpoint{cx + rx*math.Cos(angle), cy + ry*math.Sin(angle)}
 	}
-	r.fillPolygon(pts, c)
+	return pts
 }
 
 func (r *renderer) fillPentagon(x, y, w, h int, c color.RGBA) {
@@ -1405,6 +2845,481 @@ func (r *renderer) fillPlus(x, y, w, h int, c color.RGBA) {
 	r.fillRectBlend(image.Rect(x+armW, y, x+w-armW, y+h), c)
 }
 
+func (r *renderer) fillChevron(x, y, w, h int, c color.RGBA) {
+	notch := w / 4
+	pts := []fpoint{
+		{float64(x), float64(y)},
+		{float64(x + w - notch), float64(y)},
+		{float64(x + w), float64(y + h/2)},
+		{float64(x + w - notch), float64(y + h)},
+		{float64(x), float64(y + h)},
+		{float64(x + notch), float64(y + h/2)},
+	}
+	r.fillPolygon(pts, c)
+}
+
+func (r *renderer) fillParallelogram(x, y, w, h int, c color.RGBA) {
+	offset := w / 4
+	pts := []fpoint{
+		{float64(x + offset), float64(y)},
+		{float64(x + w), float64(y)},
+		{float64(x + w - offset), float64(y + h)},
+		{float64(x), float64(y + h)},
+	}
+	r.fillPolygon(pts, c)
+}
+
+func (r *renderer) fillLeftRightArrow(x, y, w, h int, c color.RGBA) {
+	headW := w / 4
+	bodyH := h / 3
+	pts := []fpoint{
+		{float64(x), float64(y + h/2)},
+		{float64(x + headW), float64(y)},
+		{float64(x + headW), float64(y + bodyH)},
+		{float64(x + w - headW), float64(y + bodyH)},
+		{float64(x + w - headW), float64(y)},
+		{float64(x + w), float64(y + h/2)},
+		{float64(x + w - headW), float64(y + h)},
+		{float64(x + w - headW), float64(y + h - bodyH)},
+		{float64(x + headW), float64(y + h - bodyH)},
+		{float64(x + headW), float64(y + h)},
+	}
+	r.fillPolygon(pts, c)
+}
+
+func (r *renderer) fillRtTriangle(x, y, w, h int, c color.RGBA) {
+	pts := []fpoint{
+		{float64(x), float64(y + h)},
+		{float64(x), float64(y)},
+		{float64(x + w), float64(y + h)},
+	}
+	r.fillPolygon(pts, c)
+}
+
+func (r *renderer) fillHomePlate(x, y, w, h int, c color.RGBA) {
+	notch := w / 5
+	pts := []fpoint{
+		{float64(x), float64(y)},
+		{float64(x + w - notch), float64(y)},
+		{float64(x + w), float64(y + h/2)},
+		{float64(x + w - notch), float64(y + h)},
+		{float64(x), float64(y + h)},
+	}
+	r.fillPolygon(pts, c)
+}
+
+func (r *renderer) fillBentArrow(x, y, w, h int, c color.RGBA, adj map[string]int) {
+	// OOXML bentArrow preset geometry.
+	// L-shaped arrow: vertical shaft going up, then turns right with arrowhead.
+	// adj1 = shaft width as fraction of width / 100000 (default 25000)
+	// adj2 = arrowhead extra width / 100000 (default 25000)
+	// adj3 = arrowhead length as fraction of width / 100000 (default 25000)
+	// adj4 = bend position as fraction of height / 100000 (default 43750)
+	adj1v := 25000
+	adj2v := 25000
+	adj3v := 25000
+	adj4v := 43750
+	if adj != nil {
+		if v, ok := adj["adj1"]; ok {
+			adj1v = v
+		}
+		if v, ok := adj["adj2"]; ok {
+			adj2v = v
+		}
+		if v, ok := adj["adj3"]; ok {
+			adj3v = v
+		}
+		if v, ok := adj["adj4"]; ok {
+			adj4v = v
+		}
+	}
+
+	fx, fy := float64(x), float64(y)
+	fw, fh := float64(w), float64(h)
+
+	shaftW := fw * float64(adj1v) / 100000.0
+	headExtra := fw * float64(adj2v) / 100000.0
+	headLen := fw * float64(adj3v) / 100000.0
+	bendY := fy + fh*float64(adj4v)/100000.0
+
+	tipX := fx + fw
+	arrowCenterY := bendY - shaftW/2
+	arrowBaseX := tipX - headLen
+	arrowTop := arrowCenterY - shaftW/2 - headExtra
+	arrowBot := arrowCenterY + shaftW/2 + headExtra
+
+	// Corner radius for rounded corners
+	cornerR := shaftW * 0.85
+	if cornerR < 1 {
+		cornerR = 1
+	}
+
+	pts := []fpoint{
+		{fx, fy + fh}, // bottom-left
+	}
+
+	// Outer corner: rounded arc from vertical outer edge to horizontal top
+	// The outer corner is at (fx, bendY - shaftW)
+	outerCornerX := fx
+	outerCornerY := bendY - shaftW
+	outerR := cornerR
+	// Clamp outer radius so it doesn't exceed available space
+	maxOuterR := math.Min(outerCornerY-(fy), fw*0.3)
+	if outerR > maxOuterR && maxOuterR > 0 {
+		outerR = maxOuterR
+	}
+	// Arc from vertical (going up) to horizontal (going right)
+	// Arc center at (outerCornerX + outerR, outerCornerY + outerR)
+	ocx := outerCornerX + outerR
+	ocy := outerCornerY + outerR
+	arcSteps := 12
+	// Start point: on the vertical edge, approaching the corner from below
+	pts = append(pts, fpoint{fx, ocy})
+	for i := 0; i <= arcSteps; i++ {
+		t := float64(i) / float64(arcSteps)
+		angle := math.Pi + t*math.Pi/2.0 // π to 3π/2
+		ax := ocx + outerR*math.Cos(angle)
+		ay := ocy + outerR*math.Sin(angle)
+		pts = append(pts, fpoint{ax, ay})
+	}
+
+	pts = append(pts,
+		fpoint{arrowBaseX, bendY - shaftW}, // top edge to arrowhead base
+		fpoint{arrowBaseX, arrowTop},        // arrowhead top
+		fpoint{tipX, arrowCenterY},          // arrowhead tip
+		fpoint{arrowBaseX, arrowBot},        // arrowhead bottom
+		fpoint{arrowBaseX, bendY},           // bottom of horizontal shaft
+	)
+
+	// Inner corner: rounded arc from horizontal bottom to vertical inner edge
+	innerX := fx + shaftW
+	innerR := cornerR
+	// Clamp inner radius
+	maxInnerR := math.Min(fh-fh*float64(adj4v)/100000.0, shaftW*0.9)
+	if innerR > maxInnerR && maxInnerR > 0 {
+		innerR = maxInnerR
+	}
+	cxArc := innerX + innerR
+	cyArc := bendY + innerR
+	pts = append(pts, fpoint{cxArc, bendY}) // start of inner arc
+	for i := 0; i <= arcSteps; i++ {
+		t := float64(i) / float64(arcSteps)
+		angle := math.Pi/2.0 + t*math.Pi/2.0 // π/2 to π
+		ax := cxArc + innerR*math.Cos(angle)
+		ay := cyArc - innerR*math.Sin(angle)
+		pts = append(pts, fpoint{ax, ay})
+	}
+
+	pts = append(pts, fpoint{innerX, fy + fh}) // bottom of inner vertical edge
+	r.fillPolygon(pts, c)
+}
+
+
+
+
+
+func (r *renderer) fillUturnArrow(x, y, w, h int, c color.RGBA, adj map[string]int) {
+	// OOXML uturnArrow preset geometry.
+	// Two vertical shafts connected by a semicircular arc at the BOTTOM.
+	// The LEFT shaft has an arrowhead pointing UP.
+	//
+	// adj1 = shaft width (fraction of w / 100000)
+	// adj2 = arrowhead extra width beyond shaft (fraction of w / 100000)
+	// adj3 = arrowhead height (fraction of h / 100000)
+	// adj4 = horizontal span of U-turn (fraction of w / 100000) — distance
+	//        between outer edges of the two shafts
+	// adj5 = total height used (fraction of h / 100000)
+	adj1v := 25000
+	adj2v := 25000
+	adj3v := 25000
+	adj4v := 43750
+	adj5v := 100000
+	if adj != nil {
+		if v, ok := adj["adj1"]; ok {
+			adj1v = v
+		}
+		if v, ok := adj["adj2"]; ok {
+			adj2v = v
+		}
+		if v, ok := adj["adj3"]; ok {
+			adj3v = v
+		}
+		if v, ok := adj["adj4"]; ok {
+			adj4v = v
+		}
+		if v, ok := adj["adj5"]; ok {
+			adj5v = v
+		}
+	}
+
+	fx, fy := float64(x), float64(y)
+	fw, fh := float64(w), float64(h)
+
+	shaftW := fw * float64(adj1v) / 100000.0
+	headExtra := fw * float64(adj2v) / 100000.0
+	headH := fh * float64(adj3v) / 100000.0
+	uWidth := fw * float64(adj4v) / 100000.0
+	totalH := fh * float64(adj5v) / 100000.0
+
+	// Two shafts side by side, connected by U-turn arc at bottom.
+	// Left shaft: x=0 to x=shaftW
+	// Right shaft: x=(uWidth-shaftW) to x=uWidth
+	leftOuter := fx
+	leftInner := fx + shaftW
+	rightOuter := fx + uWidth
+	rightInner := rightOuter - shaftW
+	if rightInner < leftInner {
+		rightInner = leftInner
+	}
+
+	// Arc at BOTTOM connecting the two shafts
+	outerRx := uWidth / 2
+	gap := rightInner - leftInner
+	if gap < 0 {
+		gap = 0
+	}
+	innerRx := gap / 2
+	arcCX := (leftOuter + rightOuter) / 2
+
+	// Arc Ry: semicircular — use outerRx as Ry for a circular arc,
+	// but cap to available height after arrowhead.
+	availH := totalH - headH
+	outerRy := outerRx
+	if outerRy > availH*0.5 {
+		outerRy = availH * 0.5
+	}
+	if outerRy < 1 {
+		outerRy = 1
+	}
+	innerRy := outerRy * innerRx / outerRx
+	if outerRx == 0 {
+		innerRy = 0
+	}
+
+	shaftTop := fy
+	arcCY := fy + totalH - outerRy
+
+	// Arrowhead on LEFT shaft, pointing UP
+	arrowCenterX := (leftOuter + leftInner) / 2
+	halfHead := shaftW/2 + headExtra
+	arrowLeft := arrowCenterX - halfHead
+	arrowRight := arrowCenterX + halfHead
+	if arrowLeft < fx {
+		arrowLeft = fx
+	}
+	if arrowRight > fx+fw {
+		arrowRight = fx + fw
+	}
+	arrowTipY := shaftTop
+	arrowBaseY := shaftTop + headH
+
+	pts := make([]fpoint, 0, 80)
+	steps := 40
+
+	// Start: right shaft outer, from top going down to arc
+	pts = append(pts, fpoint{rightOuter, shaftTop})
+	pts = append(pts, fpoint{rightOuter, arcCY})
+
+	// Outer arc (right to left, curving DOWN)
+	for i := 0; i <= steps; i++ {
+		angle := math.Pi * float64(i) / float64(steps)
+		px := arcCX + outerRx*math.Cos(angle)
+		py := arcCY + outerRy*math.Sin(angle)
+		pts = append(pts, fpoint{px, py})
+	}
+
+	// Left shaft outer, going up to arrowhead base
+	pts = append(pts, fpoint{leftOuter, arcCY})
+	pts = append(pts, fpoint{leftOuter, arrowBaseY})
+
+	// Arrowhead left wing
+	pts = append(pts, fpoint{arrowLeft, arrowBaseY})
+
+	// Arrow tip (pointing up)
+	pts = append(pts, fpoint{arrowCenterX, arrowTipY})
+
+	// Arrowhead right wing
+	pts = append(pts, fpoint{arrowRight, arrowBaseY})
+
+	// Left shaft inner, going down to arc
+	pts = append(pts, fpoint{leftInner, arrowBaseY})
+	pts = append(pts, fpoint{leftInner, arcCY})
+
+	// Inner arc (left to right, curving DOWN)
+	for i := steps; i >= 0; i-- {
+		angle := math.Pi * float64(i) / float64(steps)
+		px := arcCX + innerRx*math.Cos(angle)
+		py := arcCY + innerRy*math.Sin(angle)
+		pts = append(pts, fpoint{px, py})
+	}
+
+	// Right shaft inner, going up to top
+	pts = append(pts, fpoint{rightInner, arcCY})
+	pts = append(pts, fpoint{rightInner, shaftTop})
+
+	r.fillPolygon(pts, c)
+}
+
+// fillUturnArrowTransposed draws a U-turn arrow geometry transposed in the
+// w×h buffer. The adj fractions that normally use w now use h (visual width)
+// and those that use h now use w (visual height). The shafts run horizontally
+// (along X) and the U-turn arc is at the right side (high X).
+// This is used for 90°/270° rotations where the geometry needs to fill the
+// full buffer width to span the full visual height after rotation.
+func (r *renderer) fillUturnArrowTransposed(x, y, w, h int, c color.RGBA, adj map[string]int) {
+	adj1v := 25000
+	adj2v := 25000
+	adj3v := 25000
+	adj4v := 43750
+	adj5v := 100000
+	if adj != nil {
+		if v, ok := adj["adj1"]; ok {
+			adj1v = v
+		}
+		if v, ok := adj["adj2"]; ok {
+			adj2v = v
+		}
+		if v, ok := adj["adj3"]; ok {
+			adj3v = v
+		}
+		if v, ok := adj["adj4"]; ok {
+			adj4v = v
+		}
+		if v, ok := adj["adj5"]; ok {
+			adj5v = v
+		}
+	}
+
+	fx, fy := float64(x), float64(y)
+	fw, fh := float64(w), float64(h)
+
+	// Transposed geometry: shafts run along X, arc connects them vertically.
+	// adj1/adj2/adj4 control Y-direction dimensions → use fh (short axis in buffer,
+	// becomes visual width after 270° rotation).
+	// adj3/adj5 control X-direction dimensions → use fw (long axis in buffer,
+	// becomes visual height after rotation, must span all boxes).
+	shaftW := fh * float64(adj1v) / 100000.0    // shaft thickness (Y direction)
+	headExtra := fh * float64(adj2v) / 100000.0  // extra arrowhead width beyond shaft
+	headH := fw * float64(adj3v) / 100000.0      // arrowhead length (X direction)
+	uWidth := fh * float64(adj4v) / 100000.0     // U-turn span between shafts (Y direction)
+	totalH := fw * float64(adj5v) / 100000.0     // total shaft length (X direction)
+
+	// Two shafts side by side in Y, running along X.
+	// U-turn arc at LEFT (low X), arrowhead at RIGHT (high X).
+	// After flipV + 270° CW rotation: left→top (U-turn at visual top),
+	// right→bottom (arrowhead at visual bottom). But original PPT shows
+	// arrowhead pointing UP and U-turn at bottom, so we need:
+	// arc at RIGHT (high X) → maps to visual bottom after rotation
+	// arrowhead at LEFT (low X) → maps to visual top after rotation
+	topOuter := fy
+	topInner := fy + shaftW
+	botOuter := fy + uWidth
+	botInner := botOuter - shaftW
+	if botInner < topInner {
+		botInner = topInner
+	}
+
+	// Arc at RIGHT connecting the two shafts
+	outerRy := uWidth / 2
+	gap := botInner - topInner
+	if gap < 0 {
+		gap = 0
+	}
+	innerRy := gap / 2
+	arcCY := (topOuter + botOuter) / 2
+
+	availW := totalH - headH
+	outerRx := outerRy // circular arc
+	if outerRx > availW*0.5 {
+		outerRx = availW * 0.5
+	}
+	if outerRx < 1 {
+		outerRx = 1
+	}
+	innerRx := outerRx * innerRy / outerRy
+	if outerRy == 0 {
+		innerRx = 0
+	}
+
+	shaftLeft := fx              // left edge (arrowhead end)
+	arcCX := fx + totalH - outerRx // arc center near right edge
+
+	// Arrowhead on TOP shaft, pointing LEFT (→ visual top after rotation)
+	arrowCenterY := (topOuter + topInner) / 2
+	halfHead := shaftW/2 + headExtra
+	arrowTop := arrowCenterY - halfHead
+	arrowBot := arrowCenterY + halfHead
+	if arrowTop < fy {
+		arrowTop = fy
+	}
+	if arrowBot > fy+fh {
+		arrowBot = fy + fh
+	}
+	arrowTipX := shaftLeft
+	arrowBaseX := shaftLeft + headH
+
+	pts := make([]fpoint, 0, 80)
+	steps := 40
+
+	// Layout: arrowhead at LEFT (low X), U-turn arc at RIGHT (high X).
+	// Top shaft has the arrowhead; bottom shaft is plain.
+	// Outer path goes clockwise:
+	//   bottom-shaft left edge → right along bottom outer → arc curves RIGHT →
+	//   left along top outer → arrowhead → back along top inner →
+	//   arc inner curves RIGHT (reverse) → right along bottom inner → close
+
+	// 1. Bottom shaft outer: left edge to arc
+	pts = append(pts, fpoint{shaftLeft, botOuter})
+	pts = append(pts, fpoint{arcCX, botOuter})
+
+	// 2. Outer arc: from bottom (botOuter) to top (topOuter), curving RIGHT
+	//    At angle -π/2 (bottom): cy + outerRy = botOuter ✓
+	//    At angle +π/2 (top):    cy - outerRy = topOuter ✓
+	for i := 0; i <= steps; i++ {
+		angle := -math.Pi/2 + math.Pi*float64(i)/float64(steps)
+		px := arcCX + outerRx*math.Cos(angle)
+		py := arcCY - outerRy*math.Sin(angle)
+		pts = append(pts, fpoint{px, py})
+	}
+
+	// 3. Top shaft outer: from arc to arrowhead base
+	pts = append(pts, fpoint{arcCX, topOuter})
+	pts = append(pts, fpoint{arrowBaseX, topOuter})
+
+	// 4. Arrowhead pointing LEFT
+	pts = append(pts, fpoint{arrowBaseX, arrowTop})
+	pts = append(pts, fpoint{arrowTipX, arrowCenterY})
+	pts = append(pts, fpoint{arrowBaseX, arrowBot})
+
+	// 5. Top shaft inner: from arrowhead back to arc
+	pts = append(pts, fpoint{arrowBaseX, topInner})
+	pts = append(pts, fpoint{arcCX, topInner})
+
+	// 6. Inner arc: from top (topInner) to bottom (botInner), curving RIGHT (reverse)
+	for i := steps; i >= 0; i-- {
+		angle := -math.Pi/2 + math.Pi*float64(i)/float64(steps)
+		px := arcCX + innerRx*math.Cos(angle)
+		py := arcCY - innerRy*math.Sin(angle)
+		pts = append(pts, fpoint{px, py})
+	}
+
+	// 7. Bottom shaft inner: from arc back to left edge
+	pts = append(pts, fpoint{arcCX, botInner})
+	pts = append(pts, fpoint{shaftLeft, botInner})
+
+	r.fillPolygon(pts, c)
+}
+
+
+
+
+
+
+
+
+
+
+
 // --- Text rendering ---
 
 // getFace returns a font.Face for the given Font, falling back to basicfont.Face7x13.
@@ -1416,12 +3331,24 @@ func (r *renderer) getFace(f *Font) font.Face {
 	if sizePt <= 0 {
 		sizePt = 10
 	}
-	// Scale font size by DPI ratio (fonts are defined at 72 DPI)
-	sizePt = sizePt * r.dpi / 72.0
+	// Apply normAutofit font scale if set
+	if r.fontScale > 0 && r.fontScale != 1.0 {
+		sizePt *= r.fontScale
+	}
+	// Convert point size to pixels using the rendering scale.
+	// 1pt = 12700 EMU; scaleX converts EMU to pixels.
+	sizePixels := sizePt * 12700.0 * r.scaleX
 
-	face := r.fontCache.GetFace(f.Name, sizePt, f.Bold, f.Italic)
+	face := r.fontCache.GetFace(f.Name, sizePixels, f.Bold, f.Italic)
 	if face != nil {
 		return face
+	}
+	// Try East Asian font name if specified
+	if f.NameEA != "" {
+		face = r.fontCache.GetFace(f.NameEA, sizePixels, f.Bold, f.Italic)
+		if face != nil {
+			return face
+		}
 	}
 	// CJK fallback names
 	for _, fallback := range []string{
@@ -1431,12 +3358,123 @@ func (r *renderer) getFace(f *Font) font.Face {
 		"Noto Sans CJK SC", "Noto Sans SC", "WenQuanYi Micro Hei",
 		"Arial", "Helvetica", "DejaVu Sans",
 	} {
-		face = r.fontCache.GetFace(fallback, sizePt, f.Bold, f.Italic)
+		face = r.fontCache.GetFace(fallback, sizePixels, f.Bold, f.Italic)
 		if face != nil {
 			return face
 		}
 	}
 	return basicfont.Face7x13
+}
+
+// getCJKFace returns a font face suitable for CJK characters.
+// It tries NameEA first, then common CJK fonts.
+func (r *renderer) getCJKFace(f *Font) font.Face {
+	if r.fontCache == nil {
+		return nil
+	}
+	sizePt := float64(f.Size)
+	if sizePt <= 0 {
+		sizePt = 10
+	}
+	// Apply normAutofit font scale if set
+	if r.fontScale > 0 && r.fontScale != 1.0 {
+		sizePt *= r.fontScale
+	}
+	sizePixels := sizePt * 12700.0 * r.scaleX
+
+	// Try East Asian font name first
+	if f.NameEA != "" {
+		face := r.fontCache.GetFace(f.NameEA, sizePixels, f.Bold, f.Italic)
+		if face != nil {
+			return face
+		}
+	}
+	// CJK fallback
+	for _, name := range []string{
+		"Microsoft YaHei", "SimSun", "SimHei", "NSimSun",
+		"Yu Gothic", "Meiryo", "MS Gothic",
+		"Malgun Gothic", "Gulim",
+		"Noto Sans CJK SC", "Noto Sans SC", "WenQuanYi Micro Hei",
+	} {
+		face := r.fontCache.GetFace(name, sizePixels, f.Bold, f.Italic)
+		if face != nil {
+			return face
+		}
+	}
+	return nil
+}
+
+// containsCJK returns true if the string contains any CJK characters.
+func containsCJK(s string) bool {
+	for _, r := range s {
+		if isCJK(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitRunByCJK splits a text run into sub-runs where CJK and non-CJK
+// segments use different font faces. This ensures CJK characters are
+// rendered with a CJK-capable font even when the primary font is Latin-only.
+func (r *renderer) splitRunByCJK(text string, f *Font, latinFace, cjkFace font.Face) []textRun {
+	if cjkFace == nil || latinFace == nil {
+		// Can't split, return single run
+		face := latinFace
+		if face == nil {
+			face = cjkFace
+		}
+		if face == nil {
+			face = basicfont.Face7x13
+		}
+		return []textRun{{
+			text:  text,
+			font:  f,
+			face:  face,
+			width: font.MeasureString(face, text).Ceil(),
+		}}
+	}
+
+	var runs []textRun
+	var buf strings.Builder
+	wasCJK := false
+	first := true
+
+	for _, ch := range text {
+		nowCJK := isCJK(ch)
+		if !first && nowCJK != wasCJK {
+			// Flush buffer
+			seg := buf.String()
+			face := latinFace
+			if wasCJK {
+				face = cjkFace
+			}
+			runs = append(runs, textRun{
+				text:  seg,
+				font:  f,
+				face:  face,
+				width: font.MeasureString(face, seg).Ceil(),
+			})
+			buf.Reset()
+		}
+		buf.WriteRune(ch)
+		wasCJK = nowCJK
+		first = false
+	}
+	if buf.Len() > 0 {
+		seg := buf.String()
+		face := latinFace
+		if wasCJK {
+			face = cjkFace
+		}
+		runs = append(runs, textRun{
+			text:  seg,
+			font:  f,
+			face:  face,
+			width: font.MeasureString(face, seg).Ceil(),
+		})
+	}
+	return runs
 }
 
 // textRun holds a measured run of text with its formatting.
@@ -1460,6 +3498,7 @@ type textLine struct {
 func (r *renderer) buildTextLine(runs []textRun) textLine {
 	var tl textLine
 	tl.runs = runs
+	maxHeight := 0 // track font's recommended line-to-line height (includes line gap)
 	for _, run := range runs {
 		tl.width += run.width
 		if run.face == nil {
@@ -1474,16 +3513,141 @@ func (r *renderer) buildTextLine(runs []textRun) textLine {
 		if desc > tl.descent {
 			tl.descent = desc
 		}
+		// metrics.Height is the recommended line-to-line spacing which includes
+		// the font's internal line gap (leading). PowerPoint's default single
+		// spacing uses this full height, not just ascent+descent.
+		if h := metrics.Height.Ceil(); h > maxHeight {
+			maxHeight = h
+		}
 	}
-	tl.lineHeight = tl.ascent + tl.descent
+	// Use the font's recommended height (ascent + descent + line gap) so that
+	// default single spacing matches PowerPoint's behaviour. When the font
+	// reports no line gap, fall back to ascent + descent.
+	tl.lineHeight = maxHeight
+	if tl.lineHeight < tl.ascent+tl.descent {
+		tl.lineHeight = tl.ascent + tl.descent
+	}
 	if tl.lineHeight < 1 {
 		tl.lineHeight = 14
 	}
 	return tl
 }
 
+// measureParagraphsHeight estimates the total pixel height needed to render
+// the given paragraphs within the specified width, replicating the same line
+// building and spacing logic used by drawParagraphs.
+func (r *renderer) measureParagraphsHeight(paragraphs []*Paragraph, w, h int, anchor TextAnchorType, wordWrap bool) int {
+	if len(paragraphs) == 0 {
+		return 0
+	}
+	type lineInfo struct {
+		lineHeight  int
+		spaceBefore int
+		spaceAfter  int
+		lineSpacing int
+	}
+	var allLines []lineInfo
+
+	for _, para := range paragraphs {
+		marginLeft := 0
+		marginRight := 0
+		indent := 0
+		if para.alignment != nil {
+			marginLeft = r.emuToPixelX(para.alignment.MarginLeft)
+			marginRight = r.emuToPixelX(para.alignment.MarginRight)
+			indent = r.emuToPixelX(para.alignment.Indent)
+		}
+		var paraRuns []textRun
+		if para.bullet != nil && para.bullet.Type != BulletTypeNone {
+			bRun := r.buildBulletRun(para.bullet, para)
+			if bRun.text != "" {
+				paraRuns = append(paraRuns, bRun)
+			}
+		}
+		for _, elem := range para.elements {
+			switch e := elem.(type) {
+			case *TextRun:
+				if e.text == "" {
+					continue
+				}
+				f := e.font
+				if f == nil {
+					f = NewFont()
+				}
+				if containsCJK(e.text) && r.fontCache != nil {
+					sizePt := float64(f.Size)
+					if sizePt <= 0 {
+						sizePt = 10
+					}
+					if r.fontScale > 0 && r.fontScale != 1.0 {
+						sizePt *= r.fontScale
+					}
+					scaledPt := sizePt * 12700.0 * r.scaleX
+					latinFace := r.fontCache.GetFace(f.Name, scaledPt, f.Bold, f.Italic)
+					if latinFace == nil {
+						latinFace = r.getFace(f)
+					}
+					cjkFace := r.getCJKFace(f)
+					subRuns := r.splitRunByCJK(e.text, f, latinFace, cjkFace)
+					paraRuns = append(paraRuns, subRuns...)
+				} else {
+					face := r.getFace(f)
+					paraRuns = append(paraRuns, textRun{
+						text:  e.text,
+						font:  f,
+						face:  face,
+						width: font.MeasureString(face, e.text).Ceil(),
+					})
+				}
+			case *BreakElement:
+				paraRuns = append(paraRuns, textRun{text: "\n"})
+			}
+		}
+		availW := w - marginLeft - marginRight - indent
+		if availW < 10 {
+			availW = w
+		}
+		if !wordWrap {
+			availW = 999999
+		}
+		lines := r.wrapRunLine(paraRuns, availW)
+		if len(lines) == 0 {
+			lines = []textLine{{lineHeight: 14}}
+		}
+		for i, line := range lines {
+			li := lineInfo{
+				lineHeight:  line.lineHeight,
+				lineSpacing: para.lineSpacing,
+			}
+			if i == 0 {
+				li.spaceBefore = r.hundredthPtToPixelY(para.spaceBefore)
+			}
+			if i == len(lines)-1 {
+				li.spaceAfter = r.hundredthPtToPixelY(para.spaceAfter)
+			}
+			allLines = append(allLines, li)
+		}
+	}
+
+	totalH := 0
+	for i, li := range allLines {
+		if i > 0 {
+			totalH += li.spaceBefore
+		}
+		lh := li.lineHeight
+		if li.lineSpacing < 0 {
+			lh = int(float64(lh) * float64(-li.lineSpacing) / 100000.0)
+		} else if li.lineSpacing > 0 {
+			lh = r.hundredthPtToPixelY(li.lineSpacing)
+		}
+		totalH += lh
+		totalH += li.spaceAfter
+	}
+	return totalH
+}
+
 // drawParagraphs renders paragraphs within the given bounding box.
-func (r *renderer) drawParagraphs(paragraphs []*Paragraph, x, y, w, h int, anchor TextAnchorType) {
+func (r *renderer) drawParagraphs(paragraphs []*Paragraph, x, y, w, h int, anchor TextAnchorType, wordWrap bool) {
 	if len(paragraphs) == 0 {
 		return
 	}
@@ -1534,13 +3698,33 @@ func (r *renderer) drawParagraphs(paragraphs []*Paragraph, x, y, w, h int, ancho
 				if f == nil {
 					f = NewFont()
 				}
-				face := r.getFace(f)
-				paraRuns = append(paraRuns, textRun{
-					text:  e.text,
-					font:  f,
-					face:  face,
-					width: font.MeasureString(face, e.text).Ceil(),
-				})
+				// If text contains CJK characters, split into CJK/Latin segments
+				// so each segment uses an appropriate font face
+				if containsCJK(e.text) && r.fontCache != nil {
+					sizePt := float64(f.Size)
+					if sizePt <= 0 {
+						sizePt = 10
+					}
+					if r.fontScale > 0 && r.fontScale != 1.0 {
+						sizePt *= r.fontScale
+					}
+					scaledPt := sizePt * 12700.0 * r.scaleX
+					latinFace := r.fontCache.GetFace(f.Name, scaledPt, f.Bold, f.Italic)
+					if latinFace == nil {
+						latinFace = r.getFace(f)
+					}
+					cjkFace := r.getCJKFace(f)
+					subRuns := r.splitRunByCJK(e.text, f, latinFace, cjkFace)
+					paraRuns = append(paraRuns, subRuns...)
+				} else {
+					face := r.getFace(f)
+					paraRuns = append(paraRuns, textRun{
+						text:  e.text,
+						font:  f,
+						face:  face,
+						width: font.MeasureString(face, e.text).Ceil(),
+					})
+				}
 			case *BreakElement:
 				// Force a new line
 				paraRuns = append(paraRuns, textRun{text: "\n"})
@@ -1551,6 +3735,9 @@ func (r *renderer) drawParagraphs(paragraphs []*Paragraph, x, y, w, h int, ancho
 		availW := w - marginLeft - marginRight - indent
 		if availW < 10 {
 			availW = w
+		}
+		if !wordWrap {
+			availW = 999999
 		}
 		lines := r.wrapRunLine(paraRuns, availW)
 		if len(lines) == 0 {
@@ -1568,10 +3755,11 @@ func (r *renderer) drawParagraphs(paragraphs []*Paragraph, x, y, w, h int, ancho
 				isLast:      i == len(lines)-1,
 			}
 			if i == 0 {
-				li.spaceBefore = r.emuToPixelY(int64(para.spaceBefore))
+				// spaceBefore is in hundredths of a point from spcPts
+				li.spaceBefore = r.hundredthPtToPixelY(para.spaceBefore)
 			}
 			if i == len(lines)-1 {
-				li.spaceAfter = r.emuToPixelY(int64(para.spaceAfter))
+				li.spaceAfter = r.hundredthPtToPixelY(para.spaceAfter)
 			}
 			allLines = append(allLines, li)
 		}
@@ -1584,8 +3772,12 @@ func (r *renderer) drawParagraphs(paragraphs []*Paragraph, x, y, w, h int, ancho
 			totalH += li.spaceBefore
 		}
 		lh := li.line.lineHeight
-		if li.lineSpacing > 0 {
-			lh = int(float64(lh) * float64(li.lineSpacing) / 10000.0)
+		if li.lineSpacing < 0 {
+			// spcPct: negative value, percentage * 1000 (e.g. -150000 = 150%)
+			lh = int(float64(lh) * float64(-li.lineSpacing) / 100000.0)
+		} else if li.lineSpacing > 0 {
+			// spcPts: hundredths of a point (e.g. 1200 = 12pt)
+			lh = r.hundredthPtToPixelY(li.lineSpacing)
 		}
 		totalH += lh
 		totalH += li.spaceAfter
@@ -1607,8 +3799,10 @@ func (r *renderer) drawParagraphs(paragraphs []*Paragraph, x, y, w, h int, ancho
 		}
 
 		lh := li.line.lineHeight
-		if li.lineSpacing > 0 {
-			lh = int(float64(lh) * float64(li.lineSpacing) / 10000.0)
+		if li.lineSpacing < 0 {
+			lh = int(float64(lh) * float64(-li.lineSpacing) / 100000.0)
+		} else if li.lineSpacing > 0 {
+			lh = r.hundredthPtToPixelY(li.lineSpacing)
 		}
 
 		// Horizontal alignment
@@ -1663,6 +3857,19 @@ func (r *renderer) drawParagraphs(paragraphs []*Paragraph, x, y, w, h int, ancho
 				Dot:  fixed.P(drawX, runBaseline),
 			}
 			d.DrawString(run.text)
+
+			// Synthetic bold: if bold was requested but the font face is the
+			// regular weight (no bold variant found), re-draw with a 1px
+			// horizontal offset to embolden the glyphs.
+			if run.font != nil && run.font.Bold {
+				d2 := &font.Drawer{
+					Dst:  r.img,
+					Src:  image.NewUniform(fc),
+					Face: run.face,
+					Dot:  fixed.P(drawX+1, runBaseline),
+				}
+				d2.DrawString(run.text)
+			}
 
 			// Underline
 			if run.font != nil && run.font.Underline != UnderlineNone {
@@ -1721,6 +3928,7 @@ func (r *renderer) buildBulletRun(b *Bullet, para *Paragraph) textRun {
 	for _, elem := range para.elements {
 		if tr, ok := elem.(*TextRun); ok && tr.font != nil {
 			bulletFont.Size = tr.font.Size
+			bulletFont.Color = tr.font.Color
 			break
 		}
 	}
@@ -1743,14 +3951,162 @@ func (r *renderer) buildBulletRun(b *Bullet, para *Paragraph) textRun {
 		text = formatBulletNumber(num, b.NumFormat) + " "
 	}
 
+	// Handle symbol font characters (Wingdings, Symbol, etc.).
+	// These fonts use a special encoding where characters map to the
+	// Unicode Private Use Area (U+F000 + byte value) in TrueType.
+	// First try rendering with the actual symbol font via PUA mapping;
+	// if the font is not available, fall back to Unicode equivalents.
+	if b.Type == BulletTypeChar && isSymbolFont(bulletFont.Name) {
+		// Try PUA mapping with the actual symbol font first
+		puaText := symbolToPUA(b.Style)
+		puaFont := *bulletFont // copy
+		face := r.getFace(&puaFont)
+		if face != nil && r.fontCache != nil && r.fontCache.GetFace(bulletFont.Name, 12, false, false) != nil {
+			// Use only the symbol glyph without trailing space — the space
+			// character in symbol fonts often renders as .notdef (black box).
+			// A gap is added via width padding below instead.
+			text = puaText
+		} else {
+			// Font not available — fall back to Unicode equivalent
+			mapped := mapSymbolChar(bulletFont.Name, b.Style)
+			text = mapped + " "
+			// Use the paragraph's text font instead of the symbol font
+			bulletFont.Name = ""
+			for _, elem := range para.elements {
+				if tr, ok := elem.(*TextRun); ok && tr.font != nil {
+					bulletFont.Name = tr.font.Name
+					bulletFont.NameEA = tr.font.NameEA
+					break
+				}
+			}
+			if bulletFont.Name == "" {
+				bulletFont.Name = "Calibri"
+			}
+		}
+	}
+
 	face := r.getFace(bulletFont)
+	w := font.MeasureString(face, text).Ceil()
+	// For symbol fonts rendered via PUA (no trailing space in text),
+	// add a small gap so the bullet doesn't touch the text.
+	if b.Type == BulletTypeChar && isSymbolFont(bulletFont.Name) {
+		gap := int(bulletFont.Size / 3)
+		if gap < 2 {
+			gap = 2
+		}
+		w += gap
+	}
 	return textRun{
 		text:  text,
 		font:  bulletFont,
 		face:  face,
-		width: font.MeasureString(face, text).Ceil(),
+		width: w,
 	}
 }
+
+// isSymbolFont returns true if the font name is a symbol/dingbats font
+// whose characters need mapping to Unicode equivalents.
+func isSymbolFont(name string) bool {
+	n := strings.ToLower(name)
+	return n == "wingdings" || n == "wingdings 2" || n == "wingdings 3" ||
+		n == "symbol" || n == "webdings"
+}
+
+// symbolToPUA maps a symbol font character to the Unicode Private Use Area.
+// Symbol fonts like Wingdings store glyphs at U+F000 + original byte value
+// in their TrueType cmap table.
+func symbolToPUA(ch string) string {
+	if len(ch) == 0 {
+		return ch
+	}
+	r := []rune(ch)[0]
+	if r < 0x100 {
+		return string(rune(0xF000 + r))
+	}
+	return ch
+}
+
+// mapSymbolChar maps a character from a symbol font to a Unicode equivalent.
+// Symbol fonts like Wingdings encode characters at code points that don't
+// correspond to their visual appearance in Unicode.
+func mapSymbolChar(fontName, ch string) string {
+	if len(ch) == 0 {
+		return "•"
+	}
+	r := []rune(ch)[0]
+	n := strings.ToLower(fontName)
+
+	if n == "wingdings" {
+		// Wingdings character map (code point → Unicode equivalent)
+		switch r {
+		case 0xD8: // bowtie (two triangles forming a butterfly/wing shape)
+			return "\u22C8"
+		case 0xA8: // filled circle
+			return "●"
+		case 0x6C: // bullet
+			return "●"
+		case 0x6E: // filled square
+			return "■"
+		case 0x71: // open circle
+			return "○"
+		case 0x75, 0xA7: // diamond
+			return "◆"
+		case 0x76: // open diamond
+			return "◇"
+		case 0x77: // filled triangle right
+			return "▶"
+		case 0xFC: // check mark
+			return "✓"
+		case 0xFB: // cross mark
+			return "✗"
+		case 0xE0: // right arrow
+			return "→"
+		case 0xDF: // left arrow
+			return "←"
+		case 0xE1: // up arrow
+			return "↑"
+		case 0xE2: // down arrow
+			return "↓"
+		case 0xF0: // right pointing triangle
+			return "►"
+		case 0x9F: // star
+			return "★"
+		case 0xAB: // dash
+			return "–"
+		default:
+			return "•" // fallback to standard bullet
+		}
+	}
+
+	if n == "wingdings 2" {
+		return "•"
+	}
+
+	if n == "wingdings 3" {
+		switch r {
+		case 0x75: // triangle right
+			return "▶"
+		case 0x76: // triangle left
+			return "◀"
+		default:
+			return "•"
+		}
+	}
+
+	if n == "symbol" {
+		switch r {
+		case 0xB7: // middle dot
+			return "·"
+		case 0xD8: // empty set
+			return "∅"
+		default:
+			return string(r) // Symbol font mostly maps to Unicode directly
+		}
+	}
+
+	return "•" // fallback
+}
+
 
 // formatBulletNumber formats a number according to the bullet format.
 func formatBulletNumber(num int, format string) string {
@@ -1798,6 +4154,80 @@ func toRoman(num int) string {
 	return buf.String()
 }
 
+// isCJK reports whether the rune is a CJK character that can be broken
+// at any position (no spaces between characters).
+func isCJK(r rune) bool {
+	return unicode.Is(unicode.Han, r) ||
+		unicode.Is(unicode.Hangul, r) ||
+		unicode.Is(unicode.Hiragana, r) ||
+		unicode.Is(unicode.Katakana, r) ||
+		(r >= 0x3000 && r <= 0x303F) || // CJK Symbols and Punctuation
+		(r >= 0xFF00 && r <= 0xFFEF) // Fullwidth Forms
+}
+
+// splitCJKAware splits text into wrappable segments.
+// CJK characters become individual segments; Latin words stay grouped.
+// Spaces are preserved as separate segments to avoid inflating word widths.
+func splitCJKAware(text string) []string {
+	if text == "" {
+		return nil
+	}
+	// Fast path: pure ASCII text (no CJK possible)
+	ascii := true
+	for i := 0; i < len(text); i++ {
+		if text[i] >= 0x80 {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		return splitASCIIWords(text)
+	}
+	// Slow path: handle CJK characters
+	runes := []rune(text)
+	segments := make([]string, 0, len(runes)/2+1)
+	start := 0
+	for i, r := range runes {
+		if isCJK(r) {
+			if i > start {
+				segments = append(segments, string(runes[start:i]))
+			}
+			segments = append(segments, string(r))
+			start = i + 1
+		} else if r == ' ' || r == '\t' {
+			if i > start {
+				segments = append(segments, string(runes[start:i]))
+			}
+			segments = append(segments, string(r))
+			start = i + 1
+		}
+	}
+	if start < len(runes) {
+		segments = append(segments, string(runes[start:]))
+	}
+	return segments
+}
+
+// splitASCIIWords splits ASCII text into words and spaces as separate segments.
+func splitASCIIWords(text string) []string {
+	segments := make([]string, 0, 8)
+	start := 0
+	for i := 0; i < len(text); i++ {
+		if text[i] == ' ' || text[i] == '\t' {
+			if i > start {
+				segments = append(segments, text[start:i])
+			}
+			segments = append(segments, text[i:i+1])
+			start = i + 1
+		}
+	}
+	if start < len(text) {
+		segments = append(segments, text[start:])
+	}
+	return segments
+}
+
+
 // wrapRunLine wraps text runs into multiple lines that fit within maxWidth.
 func (r *renderer) wrapRunLine(runs []textRun, maxWidth int) []textLine {
 	if len(runs) == 0 {
@@ -1807,9 +4237,11 @@ func (r *renderer) wrapRunLine(runs []textRun, maxWidth int) []textLine {
 		maxWidth = 1
 	}
 
+	maxW26_6 := fixed.I(maxWidth)
+
 	var lines []textLine
 	var currentRuns []textRun
-	currentWidth := 0
+	var currentWidth fixed.Int26_6 // fixed-point accumulation avoids Ceil rounding buildup
 
 	for _, run := range runs {
 		if run.text == "\n" {
@@ -1822,37 +4254,36 @@ func (r *renderer) wrapRunLine(runs []textRun, maxWidth int) []textLine {
 			continue
 		}
 
-		// If the run fits, add it
-		if currentWidth+run.width <= maxWidth || len(currentRuns) == 0 {
+		runW := font.MeasureString(run.face, run.text)
+
+		// If the run fits, add it whole
+		if currentWidth+runW <= maxW26_6 {
 			currentRuns = append(currentRuns, run)
-			currentWidth += run.width
+			currentWidth += runW
 			continue
 		}
 
-		// Need to wrap: try word-level splitting
-		words := strings.Fields(run.text)
-		if len(words) <= 1 {
-			// Single word doesn't fit, force it on current line or new line
+		// Run doesn't fit — try to split into wrappable segments (CJK-aware)
+		segments := splitCJKAware(run.text)
+
+		if len(segments) <= 1 {
+			// Single segment doesn't fit, force it on new line
 			if len(currentRuns) > 0 {
 				lines = append(lines, r.buildTextLine(currentRuns))
 				currentRuns = nil
 				currentWidth = 0
 			}
 			currentRuns = append(currentRuns, run)
-			currentWidth = run.width
+			currentWidth = runW
 			continue
 		}
 
-		// Split by words
+		// Split by segments
 		var partial strings.Builder
-		for i, word := range words {
-			test := partial.String()
-			if i > 0 {
-				test += " "
-			}
-			test += word
-			tw := font.MeasureString(run.face, test).Ceil()
-			if currentWidth+tw > maxWidth && (len(currentRuns) > 0 || partial.Len() > 0) {
+		for _, seg := range segments {
+			test := partial.String() + seg
+			tw := font.MeasureString(run.face, test)
+			if currentWidth+tw > maxW26_6 && (len(currentRuns) > 0 || partial.Len() > 0) {
 				if partial.Len() > 0 {
 					pText := partial.String()
 					currentRuns = append(currentRuns, textRun{
@@ -1866,24 +4297,22 @@ func (r *renderer) wrapRunLine(runs []textRun, maxWidth int) []textLine {
 				currentRuns = nil
 				currentWidth = 0
 				partial.Reset()
-				partial.WriteString(word)
+				partial.WriteString(seg)
 			} else {
-				if partial.Len() > 0 {
-					partial.WriteString(" ")
-				}
-				partial.WriteString(word)
+				partial.WriteString(seg)
 			}
 		}
 		if partial.Len() > 0 {
 			pText := partial.String()
+			pw := font.MeasureString(run.face, pText)
 			wr := textRun{
 				text:  pText,
 				font:  run.font,
 				face:  run.face,
-				width: font.MeasureString(run.face, pText).Ceil(),
+				width: pw.Ceil(),
 			}
 			currentRuns = append(currentRuns, wr)
-			currentWidth += wr.width
+			currentWidth += pw
 		}
 	}
 
@@ -2625,7 +5054,11 @@ func scaleImageBilinear(src image.Image, dstW, dstH int) *image.RGBA {
 			lerp := func(v00, v10, v01, v11 uint32) uint8 {
 				top := float64(v00)*(1-fx) + float64(v10)*fx
 				bot := float64(v01)*(1-fx) + float64(v11)*fx
-				return uint8((top*(1-fy) + bot*fy) / 256)
+				v := (top*(1-fy) + bot*fy) / 257.0
+				if v > 255 {
+					v = 255
+				}
+				return uint8(v + 0.5)
 			}
 
 			off := dy*dst.Stride + dx*4
@@ -2665,3 +5098,446 @@ func maxInt(a, b int) int {
 	}
 	return b
 }
+
+// decodeMetafileBitmap attempts to extract a renderable image from WMF/EMF
+// metafile data. It first scans for embedded PNG or JPEG data, then falls
+// back to parsing WMF DIB (Device Independent Bitmap) records or EMF records.
+func decodeMetafileBitmap(data []byte, fc *FontCache) image.Image {
+	if len(data) < 10 {
+		return nil
+	}
+
+	// Try to find embedded PNG (89 50 4E 47) or JPEG (FF D8 FF) inside the data
+	if img := findEmbeddedImage(data); img != nil {
+		return img
+	}
+
+	// WMF: magic 01 00 09 00
+	if len(data) > 4 && data[0] == 0x01 && data[1] == 0x00 && data[2] == 0x09 && data[3] == 0x00 {
+		return decodeWMFDIB(data, fc)
+	}
+
+	// Placeable WMF: magic D7 CD C6 9A (22-byte header before standard WMF)
+	if len(data) > 26 && data[0] == 0xD7 && data[1] == 0xCD && data[2] == 0xC6 && data[3] == 0x9A {
+		return decodeWMFDIB(data[22:], fc)
+	}
+
+	// EMF: first DWORD is record type 1 (EMR_HEADER), magic 01 00 00 00
+	if len(data) > 8 && data[0] == 0x01 && data[1] == 0x00 && data[2] == 0x00 && data[3] == 0x00 {
+		return decodeEMFBitmap(data)
+	}
+
+	return nil
+}
+
+// findEmbeddedImage scans binary data for embedded PNG or JPEG signatures
+// and attempts to decode the first one found.
+func findEmbeddedImage(data []byte) image.Image {
+	for i := 0; i < len(data)-8; i++ {
+		// PNG signature: 89 50 4E 47 0D 0A 1A 0A
+		if data[i] == 0x89 && data[i+1] == 0x50 && data[i+2] == 0x4E && data[i+3] == 0x47 &&
+			data[i+4] == 0x0D && data[i+5] == 0x0A && data[i+6] == 0x1A && data[i+7] == 0x0A {
+			if img, _, err := image.Decode(bytes.NewReader(data[i:])); err == nil {
+				return img
+			}
+		}
+		// JPEG signature: FF D8 FF
+		if data[i] == 0xFF && data[i+1] == 0xD8 && data[i+2] == 0xFF {
+			if img, _, err := image.Decode(bytes.NewReader(data[i:])); err == nil {
+				return img
+			}
+		}
+	}
+	return nil
+}
+
+// decodeWMFDIB extracts a DIB bitmap from a WMF file by scanning for
+// StretchDIBits (0x0B41) or SetDIBitsToDevice (0x0D33) records that
+// contain a BITMAPINFOHEADER.
+func decodeWMFDIB(data []byte, fc *FontCache) image.Image {
+	if len(data) < 18 {
+		return nil
+	}
+
+	// Parse WMF header to get window extent
+	winW := 102 // default
+	winH := 84
+
+	// Collect all drawing operations from WMF records
+	type dibRecord struct {
+		destX, destY, destW, destH int
+		rasterOp                   uint32
+		img                        image.Image
+		bitCount                   uint16
+	}
+	type textRecord struct {
+		x, y    int
+		text    string
+		centerH bool // TA_CENTER
+	}
+
+	var dibs []dibRecord
+	var texts []textRecord
+	textAlignCenter := false
+
+	pos := 18
+	for pos+6 < len(data) {
+		recSize := uint32(data[pos]) | uint32(data[pos+1])<<8 | uint32(data[pos+2])<<16 | uint32(data[pos+3])<<24
+		recFunc := uint16(data[pos+4]) | uint16(data[pos+5])<<8
+		recBytes := int(recSize) * 2
+		if recBytes < 6 || pos+recBytes > len(data) {
+			break
+		}
+
+		switch recFunc {
+		case 0x020C: // SetWindowExt
+			if recBytes >= 10 {
+				winH = int(int16(uint16(data[pos+6]) | uint16(data[pos+7])<<8))
+				winW = int(int16(uint16(data[pos+8]) | uint16(data[pos+9])<<8))
+			}
+
+		case 0x0B41, 0x0D33: // StretchDIBits, SetDIBitsToDevice
+			if recBytes >= 26 {
+				p := pos + 6
+				rop := uint32(data[p]) | uint32(data[p+1])<<8 | uint32(data[p+2])<<16 | uint32(data[p+3])<<24
+				srcH := int(int16(uint16(data[p+4]) | uint16(data[p+5])<<8))
+				srcW := int(int16(uint16(data[p+6]) | uint16(data[p+7])<<8))
+				_ = srcH
+				_ = srcW
+				dstH := int(int16(uint16(data[p+12]) | uint16(data[p+13])<<8))
+				dstW := int(int16(uint16(data[p+14]) | uint16(data[p+15])<<8))
+				dstY := int(int16(uint16(data[p+16]) | uint16(data[p+17])<<8))
+				dstX := int(int16(uint16(data[p+18]) | uint16(data[p+19])<<8))
+
+				// Find BITMAPINFOHEADER
+				for j := pos + 6; j+40 <= pos+recBytes; j++ {
+					biSz := uint32(data[j]) | uint32(data[j+1])<<8 | uint32(data[j+2])<<16 | uint32(data[j+3])<<24
+					if biSz != 40 {
+						continue
+					}
+					biPlanes := uint16(data[j+12]) | uint16(data[j+13])<<8
+					if biPlanes != 1 {
+						continue
+					}
+					biBitCount := uint16(data[j+14]) | uint16(data[j+15])<<8
+					if biBitCount != 1 && biBitCount != 4 && biBitCount != 8 && biBitCount != 24 && biBitCount != 32 {
+						continue
+					}
+					biW := int32(uint32(data[j+4]) | uint32(data[j+5])<<8 | uint32(data[j+6])<<16 | uint32(data[j+7])<<24)
+					biH := int32(uint32(data[j+8]) | uint32(data[j+9])<<8 | uint32(data[j+10])<<16 | uint32(data[j+11])<<24)
+					if biW <= 0 || biW > 4096 {
+						continue
+					}
+					absH := biH
+					if absH < 0 {
+						absH = -absH
+					}
+					if absH <= 0 || absH > 4096 {
+						continue
+					}
+					if img := parseDIB(data[j:pos+recBytes], recBytes-(j-pos)); img != nil {
+						dibs = append(dibs, dibRecord{dstX, dstY, dstW, dstH, rop, img, biBitCount})
+					}
+					break
+				}
+			}
+
+		case 0x012E: // SetTextAlign
+			if recBytes >= 8 {
+				align := uint16(data[pos+6]) | uint16(data[pos+7])<<8
+				textAlignCenter = (align & 0x06) == 0x06 // TA_CENTER
+			}
+
+		case 0x0A32: // ExtTextOut
+			if recBytes >= 14 {
+				p := pos + 6
+				ty := int(int16(uint16(data[p]) | uint16(data[p+1])<<8))
+				tx := int(int16(uint16(data[p+2]) | uint16(data[p+3])<<8))
+				count := int(int16(uint16(data[p+4]) | uint16(data[p+5])<<8))
+				opts := uint16(data[p+6]) | uint16(data[p+7])<<8
+				strOff := 8
+				if opts&0x0006 != 0 {
+					strOff = 16
+				}
+				if p+strOff+count <= pos+recBytes && count > 0 {
+					raw := data[p+strOff : p+strOff+count]
+					text := decodeGBKToUTF8(raw)
+					texts = append(texts, textRecord{tx, ty, text, textAlignCenter})
+				}
+			}
+		}
+
+		pos += recBytes
+	}
+
+	if len(dibs) == 0 && len(texts) == 0 {
+		return nil
+	}
+
+	// Render at a higher resolution for quality (4x the WMF logical units)
+	scale := 4
+	imgW := winW * scale
+	imgH := winH * scale
+	if imgW <= 0 || imgH <= 0 {
+		imgW = 408
+		imgH = 336
+	}
+
+	canvas := image.NewRGBA(image.Rect(0, 0, imgW, imgH))
+	// Fill with white background
+	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{color.White}, image.Point{}, draw.Src)
+
+	// Draw DIBs with mask compositing
+	var maskImg image.Image
+	for _, d := range dibs {
+		dx := d.destX * scale
+		dy := d.destY * scale
+		dw := d.destW * scale
+		dh := d.destH * scale
+		scaled := scaleImageBilinear(d.img, dw, dh)
+
+		if d.rasterOp == 0x008800C6 { // SRCAND - this is the mask
+			maskImg = scaled
+		} else if d.rasterOp == 0x00660046 && maskImg != nil { // SRCINVERT with mask
+			// Apply mask: where mask is black, use the color image; where white, keep background
+			for py := 0; py < dh && py < imgH-dy; py++ {
+				for px := 0; px < dw && px < imgW-dx; px++ {
+					mr, _, _, _ := maskImg.At(px, py).RGBA()
+					if mr < 0x8000 { // mask is dark = draw pixel
+						canvas.Set(dx+px, dy+py, scaled.At(px, py))
+					}
+				}
+			}
+			maskImg = nil
+		} else {
+			// Simple draw
+			draw.Draw(canvas, image.Rect(dx, dy, dx+dw, dy+dh), scaled, image.Point{}, draw.Over)
+		}
+	}
+
+	// Draw text
+	for _, t := range texts {
+		tx := t.x * scale
+		ty := t.y * scale
+		drawWMFText(canvas, tx, ty, t.text, scale, t.centerH, fc)
+	}
+
+	return canvas
+}
+
+// decodeGBKToUTF8 converts GBK/GB2312 encoded bytes to a UTF-8 string.
+func decodeGBKToUTF8(data []byte) string {
+	decoded, err := simplifiedchinese.GBK.NewDecoder().Bytes(data)
+	if err != nil {
+		return string(data)
+	}
+	return string(decoded)
+}
+
+// drawWMFText draws text onto the canvas at the given position.
+func drawWMFText(canvas *image.RGBA, x, y int, text string, scale int, centerH bool, fc *FontCache) {
+	col := color.Black
+	// Try to use a proper font that supports Chinese characters
+	var face font.Face
+	if fc != nil {
+		// Try common Chinese fonts at a size proportional to the scale
+		fontSize := float64(10 * scale)
+		for _, name := range []string{"microsoft yahei", "微软雅黑", "simsun", "宋体", "simhei", "黑体"} {
+			if f := fc.GetFace(name, fontSize, false, false); f != nil {
+				face = f
+				break
+			}
+		}
+	}
+	if face == nil {
+		face = basicfont.Face7x13
+	}
+	d := &font.Drawer{
+		Dst:  canvas,
+		Src:  image.NewUniform(col),
+		Face: face,
+		Dot:  fixed.P(x, y+face.Metrics().Ascent.Ceil()),
+	}
+	if centerH {
+		// Measure text width and offset x to center
+		textWidth := d.MeasureString(text)
+		d.Dot.X = fixed.I(x) - textWidth/2
+	}
+	d.DrawString(text)
+}
+
+
+// parseDIB parses a BITMAPINFOHEADER + pixel data into an image.
+func parseDIB(data []byte, maxLen int) image.Image {
+	if len(data) < 40 {
+		return nil
+	}
+	biWidth := int(int32(uint32(data[4]) | uint32(data[5])<<8 | uint32(data[6])<<16 | uint32(data[7])<<24))
+	biHeight := int(int32(uint32(data[8]) | uint32(data[9])<<8 | uint32(data[10])<<16 | uint32(data[11])<<24))
+	biBitCount := int(uint16(data[14]) | uint16(data[15])<<8)
+
+	if biWidth <= 0 || biWidth > 4096 {
+		return nil
+	}
+	absHeight := biHeight
+	bottomUp := true
+	if biHeight < 0 {
+		absHeight = -biHeight
+		bottomUp = false
+	}
+	if absHeight <= 0 || absHeight > 4096 {
+		return nil
+	}
+
+	// Calculate palette size
+	paletteEntries := 0
+	if biBitCount <= 8 {
+		paletteEntries = 1 << biBitCount
+	}
+	paletteSize := paletteEntries * 4 // RGBQUAD = 4 bytes each
+	pixelOffset := 40 + paletteSize
+
+	if pixelOffset >= len(data) {
+		return nil
+	}
+
+	// Read palette
+	palette := make([]color.RGBA, paletteEntries)
+	for i := 0; i < paletteEntries && 40+i*4+3 < len(data); i++ {
+		off := 40 + i*4
+		palette[i] = color.RGBA{R: data[off+2], G: data[off+1], B: data[off], A: 255}
+	}
+
+	img := image.NewRGBA(image.Rect(0, 0, biWidth, absHeight))
+	pixData := data[pixelOffset:]
+
+	// Row stride (padded to 4-byte boundary)
+	bitsPerRow := biWidth * biBitCount
+	stride := ((bitsPerRow + 31) / 32) * 4
+
+	for row := 0; row < absHeight; row++ {
+		srcRow := row
+		dstRow := row
+		if bottomUp {
+			dstRow = absHeight - 1 - row
+		}
+		_ = srcRow
+		rowStart := row * stride
+		if rowStart >= len(pixData) {
+			break
+		}
+
+		for col := 0; col < biWidth; col++ {
+			var c color.RGBA
+			switch biBitCount {
+			case 1:
+				byteIdx := rowStart + col/8
+				if byteIdx >= len(pixData) {
+					continue
+				}
+				bit := (pixData[byteIdx] >> (7 - uint(col%8))) & 1
+				if int(bit) < len(palette) {
+					c = palette[bit]
+				}
+			case 4:
+				byteIdx := rowStart + col/2
+				if byteIdx >= len(pixData) {
+					continue
+				}
+				var nibble byte
+				if col%2 == 0 {
+					nibble = (pixData[byteIdx] >> 4) & 0x0F
+				} else {
+					nibble = pixData[byteIdx] & 0x0F
+				}
+				if int(nibble) < len(palette) {
+					c = palette[nibble]
+				}
+			case 8:
+				byteIdx := rowStart + col
+				if byteIdx >= len(pixData) {
+					continue
+				}
+				idx := pixData[byteIdx]
+				if int(idx) < len(palette) {
+					c = palette[idx]
+				}
+			case 24:
+				byteIdx := rowStart + col*3
+				if byteIdx+2 >= len(pixData) {
+					continue
+				}
+				c = color.RGBA{R: pixData[byteIdx+2], G: pixData[byteIdx+1], B: pixData[byteIdx], A: 255}
+			case 32:
+				byteIdx := rowStart + col*4
+				if byteIdx+3 >= len(pixData) {
+					continue
+				}
+				c = color.RGBA{R: pixData[byteIdx+2], G: pixData[byteIdx+1], B: pixData[byteIdx], A: 255}
+			default:
+				continue
+			}
+			img.SetRGBA(col, dstRow, c)
+		}
+	}
+
+	return img
+}
+
+// decodeEMFBitmap extracts a bitmap from an EMF (Enhanced Metafile) by
+// scanning for EMR_STRETCHDIBITS (0x51) or EMR_BITBLT (0x4C) records
+// that contain a BITMAPINFOHEADER.
+func decodeEMFBitmap(data []byte) image.Image {
+	if len(data) < 88 {
+		return nil
+	}
+	// EMF header: first record is EMR_HEADER (type=1)
+	// Each EMR record: DWORD type, DWORD size
+	pos := 0
+	var bestImg image.Image
+	for pos+8 <= len(data) {
+		recType := uint32(data[pos]) | uint32(data[pos+1])<<8 | uint32(data[pos+2])<<16 | uint32(data[pos+3])<<24
+		recSize := uint32(data[pos+4]) | uint32(data[pos+5])<<8 | uint32(data[pos+6])<<16 | uint32(data[pos+7])<<24
+
+		if recSize < 8 || pos+int(recSize) > len(data) {
+			break
+		}
+
+		// EMR_STRETCHDIBITS = 0x51, EMR_BITBLT = 0x4C, EMR_SETDIBITSTODEVICE = 0x50
+		if recType == 0x51 || recType == 0x4C || recType == 0x50 {
+			recData := data[pos : pos+int(recSize)]
+			// Scan for BITMAPINFOHEADER (biSize=40) with validation
+			for j := 8; j+40 <= len(recData); j++ {
+				biSz := uint32(recData[j]) | uint32(recData[j+1])<<8 | uint32(recData[j+2])<<16 | uint32(recData[j+3])<<24
+				if biSz != 40 {
+					continue
+				}
+				// Validate: biPlanes must be 1
+				biPlanes := uint16(recData[j+12]) | uint16(recData[j+13])<<8
+				if biPlanes != 1 {
+					continue
+				}
+				// Validate: biBitCount must be valid
+				biBitCount := uint16(recData[j+14]) | uint16(recData[j+15])<<8
+				if biBitCount != 1 && biBitCount != 4 && biBitCount != 8 && biBitCount != 24 && biBitCount != 32 {
+					continue
+				}
+				if img := parseDIB(recData[j:], len(recData)-j); img != nil {
+					if bestImg == nil || biBitCount > 1 {
+						bestImg = img
+					}
+				}
+				break
+			}
+		}
+
+		// EMR_EOF = 0x0E
+		if recType == 0x0E {
+			break
+		}
+
+		pos += int(recSize)
+	}
+	return bestImg
+}
+

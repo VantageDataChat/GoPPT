@@ -20,6 +20,9 @@ type Presentation struct {
 	slideMasters           []*SlideMaster
 	activeSlideIndex       int
 	layout                 *DocumentLayout
+	// themeColors maps scheme color names (dk1, dk2, lt1, lt2, accent1..accent6,
+	// hlink, folHlink) to ARGB hex strings (e.g. "FF000000").
+	themeColors map[string]string
 }
 
 // New creates a new Presentation with one default blank slide.

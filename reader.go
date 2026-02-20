@@ -89,6 +89,9 @@ func (r *PPTXReader) ReadFromReader(reader io.ReaderAt, size int64) (*Presentati
 	// Read core properties (non-fatal: missing properties are acceptable)
 	_ = r.readCoreProperties(zr, pres)
 
+	// Read theme colors (non-fatal)
+	r.readThemeColors(zr, pres)
+
 	// Read presentation.xml to get slide list and layout
 	slideRels, err := r.readPresentation(zr, pres)
 	if err != nil {
