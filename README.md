@@ -10,6 +10,17 @@
 
 A pure Go library for creating, reading, and writing PowerPoint (.pptx) files. Zero external dependencies. Inspired by [PHPOffice/PHPPresentation](https://github.com/PHPOffice/PHPPresentation).
 
+### Rendering
+
+GoPPT includes a built-in slide renderer that produces PNG images closely matching Microsoft PowerPoint's native rendering. The renderer features:
+
+- Dual font-face measurement system (HintingNone for layout, HintingFull for rendering) to match PowerPoint's DirectWrite text metrics
+- CJK-aware line wrapping with kinsoku (禁則処理) punctuation handling
+- Accurate text box layout with auto-fit, auto-shrink, and overflow control
+- Shape rendering: fills, borders, shadows, custom geometry paths, arrowheads
+- Chart rendering: bar, line, area, pie, doughnut, scatter, radar
+- Image compositing with rotation, flip, and group transforms
+
 ### Features
 
 - Create and save `.pptx` files (OOXML / PowerPoint 2007+)
@@ -126,6 +137,17 @@ See [API Documentation](API.md) for the full reference, or check `example_test.g
 ## 中文
 
 纯 Go 语言实现的 PowerPoint (.pptx) 文件创建、读取和写入库。零外部依赖。灵感来自 [PHPOffice/PHPPresentation](https://github.com/PHPOffice/PHPPresentation)。
+
+### 渲染能力
+
+GoPPT 内置幻灯片渲染器，可将幻灯片导出为 PNG 图片，渲染效果接近 Microsoft PowerPoint 原生渲染。渲染器特性：
+
+- 双字体度量系统（HintingNone 用于排版，HintingFull 用于渲染），匹配 PowerPoint DirectWrite 的文本度量
+- CJK 感知的自动换行，支持禁則処理（行首行尾标点规则）
+- 精确的文本框排版：自动适应、自动缩放、溢出控制
+- 形状渲染：填充、边框、阴影、自定义几何路径、箭头
+- 图表渲染：柱状图、折线图、面积图、饼图、环形图、散点图、雷达图
+- 图片合成：旋转、翻转、组合变换
 
 ### 功能特性
 

@@ -444,7 +444,22 @@ pres, err := reader.ReadFromReader(readerAt, size)
 ```
 
 ---
----
+
+### Rendering
+
+GoPPT includes a built-in renderer that exports slides as PNG images with rendering quality close to Microsoft PowerPoint.
+
+```go
+// Render a single slide to PNG
+reader := &ppt.PPTXReader{}
+pres, _ := reader.Read("input.pptx")
+
+slide, _ := pres.GetSlide(0)
+pngData, err := pres.RenderSlide(slide, 1920) // width in pixels
+// pngData contains the PNG image bytes
+```
+
+The renderer uses a dual font-face architecture: HintingNone faces for text layout (matching PowerPoint's DirectWrite metrics) and HintingFull faces for crisp glyph rendering. CJK text receives special handling with kinsoku line-breaking rules and tuned line-height calculations.
 
 <a id="中文"></a>
 
@@ -842,3 +857,21 @@ pres, err := reader.Read("输入.pptx")
 // 从 io.ReaderAt 读取
 pres, err := reader.ReadFromReader(readerAt, size)
 ```
+
+---
+
+### 渲染 (Rendering)
+
+GoPPT 内置渲染器，可将幻灯片导出为 PNG 图片，渲染效果接近 Microsoft PowerPoint。
+
+```go
+// 将单张幻灯片渲染为 PNG
+reader := &ppt.PPTXReader{}
+pres, _ := reader.Read("输入.pptx")
+
+slide, _ := pres.GetSlide(0)
+pngData, err := pres.RenderSlide(slide, 1920) // 宽度（像素）
+// pngData 包含 PNG 图片数据
+```
+
+渲染器采用双字体度量架构：HintingNone 字体用于文本排版（匹配 PowerPoint DirectWrite 的度量），HintingFull 字体用于清晰的字形渲染。CJK 文本有专门的处理，包括禁則処理换行规则和优化的行高计算。
