@@ -693,20 +693,10 @@ func (r *renderer) renderRichText(s *RichTextShape) {
 		}
 	}
 	// For AutoFitNone, PowerPoint does NOT shrink text — it lets text overflow
-	// the shape boundary. However, Go's CJK font metrics often produce larger
-	// line heights than PowerPoint's DirectWrite, causing text that fits
-	// perfectly in the original authoring environment to overflow here.
-	// Apply a very conservative auto-shrink only when the overflow is small
-	// (≤20% of available height), which indicates font metric differences
-	// rather than intentionally overflowing text (e.g. timeline annotations).
-	isAutoFitNone := false
-	if s.autoFit == AutoFitNone && (s.fontScale == 0 || s.fontScale == 100000) && th > 0 {
-		textH := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, wordWrap)
-		if textH > th && float64(textH) <= float64(th)*1.20 {
-			shouldAutoShrink = true
-			isAutoFitNone = true
-		}
-	}
+	// the shape boundary. Do not apply any auto-shrink here; instead let the
+	// text overflow naturally (the renderer already handles overflow by
+	// expanding the buffer height).
+	isAutoFitNone := s.autoFit == AutoFitNone
 	if shouldAutoShrink {
 		textH := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, wordWrap)
 		if textH > th && th > 0 {
@@ -5322,12 +5312,11 @@ func (r *renderer) wrapRunLine(runs []textRun, maxWidth int) []textLine {
 	}
 
 	maxW26_6 := fixed.I(maxWidth)
-	// Add tolerance to account for differences between Go's text measurement
-	// and PowerPoint's DirectWrite renderer. Go's opentype package doesn't
-	// apply the same GPOS/GSUB shaping as DirectWrite, causing text segments
-	// (especially CJK) to measure wider. Use 6% tolerance to allow more
-	// characters per line, matching PowerPoint's wrapping behaviour.
-	maxW26_6 += maxW26_6 * 6 / 100
+	// Add a small tolerance (~3%) to account for differences between Go's
+	// text measurement and PowerPoint's DirectWrite renderer. Go's opentype
+	// package doesn't apply the same GPOS/GSUB shaping as DirectWrite,
+	// causing text segments (especially mixed Latin+CJK) to measure wider.
+	maxW26_6 += maxW26_6 * 3 / 100
 
 	var lines []textLine
 	var currentRuns []textRun
@@ -5442,7 +5431,7 @@ func (r *renderer) wrapRunLineWithIndent(runs []textRun, firstLineWidth, contLin
 			w = firstLineWidth
 		}
 		mw := fixed.I(w)
-		mw += mw * 6 / 100 // 6% tolerance for CJK glyph width differences
+		mw += mw * 3 / 100 // 3% tolerance
 		return mw
 	}
 
