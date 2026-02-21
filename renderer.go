@@ -463,7 +463,12 @@ func (r *renderer) renderRotatedExpanded(x, y, w, h, bufH, rotation int, flipH, 
 
 	// OOXML transform order: rotate first, then flip.
 	// We combine both into a single inverse mapping from destination to source.
-	rad := -float64(rotation) * math.Pi / 180.0
+	// OOXML rot is clockwise; in screen coords (Y-down) the standard rotation
+	// matrix [cos,-sin;sin,cos] already rotates clockwise for positive angles.
+	// The inverse mapping (dest→src) for a clockwise rotation by θ is:
+	//   sx = fx*cos(θ) + fy*sin(θ)
+	//   sy = -fx*sin(θ) + fy*cos(θ)
+	rad := float64(rotation) * math.Pi / 180.0
 	cosA := math.Cos(rad)
 	sinA := math.Sin(rad)
 	cx := float64(w) / 2
@@ -482,17 +487,20 @@ func (r *renderer) renderRotatedExpanded(x, y, w, h, bufH, rotation int, flipH, 
 		ry := float64(dy) - destCY
 		for dx := minDX; dx < maxDX; dx++ {
 			rx := float64(dx) - destCX
-			// Step 1: un-flip (flip is self-inverse, applied in rotated space)
-			fx, fy := rx, ry
+			// OOXML forward transform order: flip first, then rotate.
+			// Inverse: un-rotate first, then un-flip.
+			// Step 1: un-rotate (inverse rotation)
+			ux := rx*cosA + ry*sinA
+			uy := -rx*sinA + ry*cosA
+			// Step 2: un-flip
 			if flipH {
-				fx = -fx
+				ux = -ux
 			}
 			if flipV {
-				fy = -fy
+				uy = -uy
 			}
-			// Step 2: un-rotate (inverse rotation)
-			sx := fx*cosA + fy*sinA + cx
-			sy := -fx*sinA + fy*cosA + cy
+			sx := ux + cx
+			sy := uy + cy
 			ix, iy := int(sx), int(sy)
 			if ix >= 0 && ix < w && iy >= 0 && iy < bufH {
 				sOff := iy*tmp.Stride + ix*4
@@ -666,30 +674,106 @@ func (r *renderer) renderRichText(s *RichTextShape) {
 
 	// Auto-shrink text when normAutofit is set without an explicit fontScale.
 	// PowerPoint dynamically calculates the scale to fit text within the box.
-	// Also apply auto-shrink for AutoFitNone when text still overflows after
-	// inset reduction — Go's CJK font metrics often produce larger line heights
-	// than PowerPoint, causing text to overflow shapes that fit perfectly in
-	// the original authoring environment.
 	shouldAutoShrink := false
 	if s.autoFit == AutoFitNormal && (s.fontScale == 0 || s.fontScale == 100000) {
 		shouldAutoShrink = true
-	} else if s.autoFit == AutoFitNone && (s.fontScale == 0 || s.fontScale == 100000) {
+	}
+	// For spAutoFit (AutoFitShape), PowerPoint resizes the shape to fit text.
+	// Since we cannot resize the shape at render time, apply a conservative
+	// shrink with a high floor. The overflow is typically caused by font
+	// metric differences between Go and PowerPoint rather than text that
+	// genuinely needs a much larger shape. Using a high floor (0.92)
+	// preserves text readability while keeping text roughly within bounds.
+	isAutoFitShape := false
+	if s.autoFit == AutoFitShape && (s.fontScale == 0 || s.fontScale == 100000) && th > 0 {
 		textH := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, wordWrap)
-		if textH > h && h > 0 {
-			// Text exceeds the full shape height — font metrics are too large
+		if textH > th {
 			shouldAutoShrink = true
+			isAutoFitShape = true
+		}
+	}
+	// For AutoFitNone, PowerPoint does NOT shrink text — it lets text overflow
+	// the shape boundary. However, Go's CJK font metrics often produce larger
+	// line heights than PowerPoint's DirectWrite, causing text that fits
+	// perfectly in the original authoring environment to overflow here.
+	// Apply a very conservative auto-shrink only when the overflow is small
+	// (≤20% of available height), which indicates font metric differences
+	// rather than intentionally overflowing text (e.g. timeline annotations).
+	isAutoFitNone := false
+	if s.autoFit == AutoFitNone && (s.fontScale == 0 || s.fontScale == 100000) && th > 0 {
+		textH := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, wordWrap)
+		if textH > th && float64(textH) <= float64(th)*1.20 {
+			shouldAutoShrink = true
+			isAutoFitNone = true
 		}
 	}
 	if shouldAutoShrink {
 		textH := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, wordWrap)
 		if textH > th && th > 0 {
-			// Binary search for the right scale factor
-			lo, hi := 0.1, 1.0
-			for i := 0; i < 10; i++ {
+			// Binary search for the right scale factor.
+			// For AutoFitNone, use a high floor (0.85) since PowerPoint does
+			// not shrink at all — we only compensate for font metric differences.
+			// For AutoFitShape, use a high floor (0.92) since PowerPoint
+			// resizes the shape rather than shrinking text.
+			lo, hi := 0.3, 1.0
+			if isAutoFitNone {
+				lo = 0.85
+			}
+			if isAutoFitShape {
+				lo = 0.92
+			}
+			for i := 0; i < 15; i++ {
 				mid := (lo + hi) / 2
 				r.fontScale = mid
 				mh := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, wordWrap)
 				if mh > th {
+					hi = mid
+				} else {
+					lo = mid
+				}
+			}
+			r.fontScale = lo
+		}
+	}
+
+	// Horizontal overflow detection: Go's font metrics can produce wider text
+	// than PowerPoint's DirectWrite renderer, causing text to overflow the
+	// right edge of the text box. When word-wrap is enabled and any wrapped
+	// line still exceeds the text area width, shrink the font to fit.
+	// Apply the same 3% tolerance used by wrapRunLine so that lines allowed
+	// by the wrapping tolerance don't falsely trigger horizontal shrinking.
+	if wordWrap && tw > 0 {
+		hTolerance := tw * 103 / 100 // 3% tolerance matching wrapRunLine
+		maxLW := r.measureMaxLineWidth(s.paragraphs, tw, wordWrap)
+		if maxLW > hTolerance {
+			// Binary search for a scale that fits horizontally.
+			// For AutoFitNone, use a higher floor to avoid over-shrinking.
+			// Use the current fontScale as hi (may already be reduced by
+			// vertical shrink). Ensure the combined vertical+horizontal
+			// shrink doesn't go below a reasonable floor.
+			lo, hi := 0.5, r.fontScale
+			if isAutoFitNone && lo < 0.85 {
+				lo = 0.85
+			}
+			if hi <= 0 {
+				hi = 1.0
+			}
+			// Prevent compound shrinking from going too low: if vertical
+			// shrink already reduced the scale, raise the floor so the
+			// combined effect doesn't over-shrink text. But never raise
+			// the floor above hi (the current scale from vertical shrink).
+			compoundFloor := hi * 0.85
+			if lo < compoundFloor && compoundFloor <= hi {
+				lo = compoundFloor
+			}
+			if lo > hi {
+				lo = hi
+			}
+			for i := 0; i < 12; i++ {
+				mid := (lo + hi) / 2
+				r.fontScale = mid
+				mw := r.measureMaxLineWidth(s.paragraphs, tw, wordWrap)
+				if mw > hTolerance {
 					hi = mid
 				} else {
 					lo = mid
@@ -788,6 +872,21 @@ func (r *renderer) renderRichText(s *RichTextShape) {
 		if drawTH < th {
 			drawTH = th
 		}
+		// For middle-anchored text that overflows the inset area, center
+		// relative to the full shape height so text doesn't appear shifted
+		// down by the top inset. PowerPoint centers overflowing text within
+		// the shape bounds, not the inset-reduced text body.
+		if s.textAnchor == TextAnchorMiddle && overflowH > 0 {
+			ty = oy
+			drawTH = h
+		}
+		// For bottom-anchored text, keep the original text area height so
+		// that drawParagraphs computes startY = ty + th - totalH, which
+		// places text above the shape when it overflows. Expanding drawTH
+		// by overflowH would cancel out the upward offset.
+		if s.textAnchor == TextAnchorBottom && drawTH > th {
+			drawTH = th
+		}
 
 		if !skipText {
 			if vertRotation != 0 {
@@ -823,6 +922,13 @@ func (r *renderer) renderRichText(s *RichTextShape) {
 			ty := oy + pxT
 			drawTH := bufH - pxT - pxB
 			if drawTH < th {
+				drawTH = th
+			}
+			if s.textAnchor == TextAnchorMiddle && overflowH > 0 {
+				ty = oy
+				drawTH = h
+			}
+			if s.textAnchor == TextAnchorBottom && drawTH > th {
 				drawTH = th
 			}
 			if vertRotation != 0 {
@@ -930,11 +1036,14 @@ func (r *renderer) renderAutoShape(s *AutoShape) {
 		rect := image.Rect(ox, oy, ox+w, oy+h)
 		if s.shadow != nil && s.shadow.Visible {
 			switch s.shapeType {
-			case AutoShapeRoundedRect:
+			case AutoShapeRoundedRect, AutoShapeCallout1:
 				sRadius := minInt(w, h) * 16667 / 100000
 				if s.adjustValues != nil {
 					if adj, ok := s.adjustValues["adj"]; ok {
 						sRadius = minInt(w, h) * adj / 200000
+					}
+					if adj, ok := s.adjustValues["adj3"]; ok && s.shapeType == AutoShapeCallout1 {
+						sRadius = int(math.Min(float64(w), float64(h)) * float64(adj) / 100000.0)
 					}
 				}
 				tr.renderShadowRounded(s.shadow, rect, sRadius)
@@ -1041,15 +1150,41 @@ func (r *renderer) renderAutoShape(s *AutoShape) {
 
 			// Auto-shrink when text overflows the full shape height —
 			// CJK font metrics in Go are often larger than PowerPoint's.
+			// Use a conservative floor to avoid making text too small.
 			if (s.fontScale == 0 || s.fontScale == 100000) {
 				atextH := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, true)
 				if atextH > h && h > 0 && atextH > th && th > 0 {
-					lo, hi := 0.1, 1.0
+					lo, hi := 0.65, 1.0
 					for i := 0; i < 10; i++ {
 						mid := (lo + hi) / 2
 						r.fontScale = mid
 						mh := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, true)
 						if mh > th {
+							hi = mid
+						} else {
+							lo = mid
+						}
+					}
+					r.fontScale = lo
+				}
+			}
+
+			// Horizontal overflow: shrink font when wrapped lines still
+			// exceed the text area width due to font metric differences.
+			// Apply the same 3% tolerance used by wrapRunLine.
+			if tw > 0 && (s.fontScale == 0 || s.fontScale == 100000) {
+				hTol := tw * 103 / 100
+				maxLW := r.measureMaxLineWidth(s.paragraphs, tw, true)
+				if maxLW > hTol {
+					lo, hi := 0.5, r.fontScale
+					if hi <= 0 {
+						hi = 1.0
+					}
+					for i := 0; i < 12; i++ {
+						mid := (lo + hi) / 2
+						r.fontScale = mid
+						mw := r.measureMaxLineWidth(s.paragraphs, tw, true)
+						if mw > hTol {
 							hi = mid
 						} else {
 							lo = mid
@@ -1075,13 +1210,11 @@ func (r *renderer) renderAutoShape(s *AutoShape) {
 		}
 	}
 
-	// For uturnArrow with 90/270 rotation, swap geometry dimensions.
-	needsGeomSwap := s.shapeType == AutoShapeUturnArrow &&
-		(rotation == 90 || rotation == 270)
-
 	// For rtTriangle with 90/270 rotation, OOXML ext gives the rotated
 	// bounding box size. Draw the mirror-image triangle in the buffer so
 	// that after rotation the filled area covers the correct half.
+	// With correct clockwise rotation, the standard triangle vertices
+	// need to be adjusted for the swapped buffer dimensions.
 	needsRtTriSwap := s.shapeType == AutoShapeRtTriangle &&
 		(rotation == 90 || rotation == 270)
 
@@ -1090,24 +1223,171 @@ func (r *renderer) renderAutoShape(s *AutoShape) {
 			if s.fill != nil && s.fill.Type != FillNone {
 				fc := argbToRGBA(s.fill.Color)
 				fc = tr.scaleAlpha(fc)
+				// Draw mirror-image triangle that, after correct clockwise
+				// rotation, produces the expected right-triangle orientation.
 				pts := []fpoint{
 					{0, 0},
-					{float64(w), 0},
+					{0, float64(h)},
 					{float64(w), float64(h)},
 				}
 				tr.fillPolygon(pts, fc)
 			}
 		}
 		r.renderRotated(x, y, w, h, rotation, flipH, flipV, drawSwapped)
-	} else if needsGeomSwap {
-		drawSwapped := func(tr *renderer) {
-			if s.fill != nil && s.fill.Type != FillNone {
-				fc := argbToRGBA(s.fill.Color)
-				fc = tr.scaleAlpha(fc)
-				tr.fillUturnArrowTransposed(0, 0, w, h, fc, s.adjustValues)
+	} else if (flipH || flipV) && len(s.paragraphs) > 0 {
+		// PowerPoint flips shape geometry but keeps text readable (un-flipped).
+		// Phase 1: render geometry only (fill + border) with flip applied.
+		drawGeomOnly := func(tr *renderer) {
+			ox, oy := x, y
+			if tr != r {
+				ox, oy = 0, 0
+			}
+			rect := image.Rect(ox, oy, ox+w, oy+h)
+			if s.shadow != nil && s.shadow.Visible {
+				switch s.shapeType {
+				case AutoShapeRoundedRect, AutoShapeCallout1:
+					sRadius := minInt(w, h) * 16667 / 100000
+					if s.adjustValues != nil {
+						if adj, ok := s.adjustValues["adj"]; ok {
+							sRadius = minInt(w, h) * adj / 200000
+						}
+						if adj, ok := s.adjustValues["adj3"]; ok && s.shapeType == AutoShapeCallout1 {
+							sRadius = int(math.Min(float64(w), float64(h)) * float64(adj) / 100000.0)
+						}
+					}
+					tr.renderShadowRounded(s.shadow, rect, sRadius)
+				case AutoShapeRectangle, "":
+					tr.renderShadow(s.shadow, rect)
+				default:
+				}
+			}
+			tr.renderAutoShapeFill(s, ox, oy, w, h)
+			tr.renderAutoShapeBorder(s, ox, oy, w, h)
+			if s.shapeType == AutoShapeArc && (s.border == nil || s.border.Style == BorderNone) {
+				defPw := maxInt(int(tr.scaleX*12700.0), 1)
+				defC := color.RGBA{A: 255}
+				tr.renderArcBorder(s, ox, oy, w, h, defC, defPw)
 			}
 		}
-		r.renderRotated(x, y, w, h, rotation, flipH, flipV, drawSwapped)
+		r.renderRotated(x, y, w, h, rotation, flipH, flipV, drawGeomOnly)
+
+		// Phase 2: render text only (rotation only, no flip) so text stays readable.
+		drawTextOnly := func(tr *renderer) {
+			ox, oy := x, y
+			if tr != r {
+				ox, oy = 0, 0
+			}
+			lIns, rIns, tIns, bIns := int64(91440), int64(91440), int64(45720), int64(45720)
+			if s.insetsSet {
+				lIns, rIns, tIns, bIns = s.insetLeft, s.insetRight, s.insetTop, s.insetBottom
+			}
+			pxL := r.emuToPixelX(lIns)
+			pxR := r.emuToPixelX(rIns)
+			pxT := r.emuToPixelY(tIns)
+			pxB := r.emuToPixelY(bIns)
+			if !s.insetsSet {
+				maxInsetH := int(float64(h) * 0.35)
+				maxInsetW := int(float64(w) * 0.35)
+				if pxT+pxB > maxInsetH {
+					scale := float64(maxInsetH) / float64(pxT+pxB)
+					pxT = int(float64(pxT) * scale)
+					pxB = int(float64(pxB) * scale)
+				}
+				if pxL+pxR > maxInsetW {
+					scale := float64(maxInsetW) / float64(pxL+pxR)
+					pxL = int(float64(pxL) * scale)
+					pxR = int(float64(pxR) * scale)
+				}
+			}
+			tx, ty, tw, th := ox+pxL, oy+pxT, w-pxL-pxR, h-pxT-pxB
+			if s.shapeType == AutoShapeEllipse {
+				insetX := int(float64(w) * 0.1464)
+				insetY := int(float64(h) * 0.1464)
+				etx := ox + insetX
+				ety := oy + insetY
+				etw := w - 2*insetX
+				eth := h - 2*insetY
+				if etx > tx { tx = etx }
+				if ety > ty { ty = ety }
+				if etx+etw < ox+pxL+tw { tw = etx + etw - tx }
+				if ety+eth < oy+pxT+th { th = ety + eth - ty }
+			}
+			if tw < 1 { tw = w }
+			if th < 1 { th = h }
+			if !s.insetsSet {
+				textH := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, true)
+				if textH > th && th > 0 && (pxT+pxB) > 0 {
+					needed := textH - th
+					avail := pxT + pxB
+					if needed >= avail {
+						pxT = 0
+						pxB = 0
+					} else {
+						sc := float64(avail-needed) / float64(avail)
+						pxT = int(float64(pxT) * sc)
+						pxB = int(float64(pxB) * sc)
+					}
+					tx = ox + pxL
+					ty = oy + pxT
+					th = h - pxT - pxB
+					if th < 1 { th = h }
+				}
+			}
+			// Auto-shrink when text overflows
+			if s.fontScale == 0 || s.fontScale == 100000 {
+				atextH := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, true)
+				if atextH > h && h > 0 && atextH > th && th > 0 {
+					lo, hi := 0.65, 1.0
+					for i := 0; i < 10; i++ {
+						mid := (lo + hi) / 2
+						r.fontScale = mid
+						mh := r.measureParagraphsHeight(s.paragraphs, tw, th, s.textAnchor, true)
+						if mh > th {
+							hi = mid
+						} else {
+							lo = mid
+						}
+					}
+					r.fontScale = lo
+				}
+				// Horizontal overflow — apply 3% tolerance matching wrapRunLine
+				hTol := tw * 103 / 100
+				maxLW := r.measureMaxLineWidth(s.paragraphs, tw, true)
+				if maxLW > hTol && tw > 0 {
+					lo, hi := 0.5, r.fontScale
+					if hi <= 0 {
+						hi = 1.0
+					}
+					for i := 0; i < 12; i++ {
+						mid := (lo + hi) / 2
+						r.fontScale = mid
+						mw := r.measureMaxLineWidth(s.paragraphs, tw, true)
+						if mw > hTol {
+							hi = mid
+						} else {
+							lo = mid
+						}
+					}
+					r.fontScale = lo
+				}
+			}
+			if vertRotation != 0 {
+				vtw, vth := th, tw
+				if vtw > 0 && vth > 0 {
+					tmp := image.NewRGBA(image.Rect(0, 0, vtw, vth))
+					tmpR := &renderer{img: tmp, scaleX: tr.scaleX, scaleY: tr.scaleY, fontCache: tr.fontCache, dpi: tr.dpi, fontScale: tr.fontScale}
+					tmpR.drawParagraphs(s.paragraphs, 0, 0, vtw, vth, s.textAnchor, true)
+					rotateAndComposite(tr.img, tmp, tx, ty, tw, th, vertRotation)
+				}
+			} else {
+				tr.drawParagraphs(s.paragraphs, tx, ty, tw, th, s.textAnchor, true)
+			}
+		}
+		if rotation != 0 {
+			r.renderRotated(x, y, w, h, rotation, false, false, drawTextOnly)
+		} else {
+			drawTextOnly(r)
+		}
 	} else if rotation != 0 || flipH || flipV {
 		r.renderRotated(x, y, w, h, rotation, flipH, flipV, drawContent)
 	} else {
@@ -1149,7 +1429,7 @@ func (r *renderer) renderAutoShapeFill(s *AutoShape, x, y, w, h int) {
 	case AutoShapeHexagon:
 		r.fillHexagon(x, y, w, h, fc)
 	case AutoShapeFlowchartPreparation:
-		r.fillHexagon(x, y, w, h, fc)
+		r.fillFlowChartPreparation(x, y, w, h, fc)
 	case AutoShapePentagon:
 		r.fillPentagon(x, y, w, h, fc)
 	case AutoShapeArrowRight:
@@ -1178,6 +1458,8 @@ func (r *renderer) renderAutoShapeFill(s *AutoShape, x, y, w, h int) {
 		r.fillRtTriangle(x, y, w, h, fc)
 	case AutoShapeHomePlate:
 		r.fillHomePlate(x, y, w, h, fc)
+	case AutoShapeCallout1:
+		r.fillWedgeRoundRectCallout(x, y, w, h, fc, s.adjustValues)
 	case AutoShapeSnip2SameRect:
 		r.fillSnip2SameRect(x, y, w, h, fc, s.adjustValues)
 	case AutoShapeUturnArrow:
@@ -1215,7 +1497,7 @@ func (r *renderer) renderAutoShapeBorder(s *AutoShape, x, y, w, h int) {
 	case AutoShapeDiamond:
 		r.drawDiamond(x, y, w, h, bc, pw)
 	case AutoShapeFlowchartPreparation:
-		pts := regularPolygonPoints(x, y, w, h, 6, 0)
+		pts := flowChartPreparationPoints(x, y, w, h)
 		r.drawPolygon(pts, bc, pw)
 	case AutoShapeChevron:
 		notch := w / 4
@@ -1317,6 +1599,8 @@ func (r *renderer) renderAutoShapeBorder(s *AutoShape, x, y, w, h int) {
 	case AutoShapeSnip2SameRect:
 		pts := r.snip2SameRectPoints(x, y, w, h, s.adjustValues)
 		r.drawPolygon(pts, bc, pw)
+	case AutoShapeCallout1:
+		r.drawWedgeRoundRectCalloutBorder(x, y, w, h, bc, pw, s.adjustValues)
 	case AutoShapeArc:
 		r.renderArcBorder(s, x, y, w, h, bc, pw)
 	default:
@@ -3233,6 +3517,28 @@ func (r *renderer) fillHexagon(x, y, w, h int, c color.RGBA) {
 	r.fillRegularPolygon(x, y, w, h, 6, 0, c)
 }
 
+// flowChartPreparationPoints returns the 6 vertices for the OOXML flowChartPreparation shape.
+// Unlike a regular hexagon inscribed in an ellipse, this shape fills the entire bounding box:
+// left/right points at mid-height, top/bottom edges span full width minus an inset.
+func flowChartPreparationPoints(x, y, w, h int) []fpoint {
+	inset := float64(w) / 5.0
+	fx, fy, fw, fh := float64(x), float64(y), float64(w), float64(h)
+	return []fpoint{
+		{fx, fy + fh/2},          // left point
+		{fx + inset, fy},          // top-left
+		{fx + fw - inset, fy},     // top-right
+		{fx + fw, fy + fh/2},     // right point
+		{fx + fw - inset, fy + fh}, // bottom-right
+		{fx + inset, fy + fh},     // bottom-left
+	}
+}
+
+func (r *renderer) fillFlowChartPreparation(x, y, w, h int, c color.RGBA) {
+	pts := flowChartPreparationPoints(x, y, w, h)
+	r.fillPolygon(pts, c)
+}
+
+
 func (r *renderer) fillStar(x, y, w, h, points int, c color.RGBA) {
 	cx := float64(x) + float64(w)/2
 	cy := float64(y) + float64(h)/2
@@ -3395,6 +3701,176 @@ func (r *renderer) fillHomePlate(x, y, w, h int, c color.RGBA) {
 	}
 	r.fillPolygon(pts, c)
 }
+// fillWedgeRoundRectCallout draws a rounded-rectangle callout shape.
+// OOXML wedgeRoundRectCallout has three adjust values:
+//   adj1: X offset of callout tip from center (1/100000 of width, default -20833)
+//   adj2: Y offset of callout tip from center (1/100000 of height, default 62500)
+//   adj3: corner radius (1/100000 of min(w,h), default 16667)
+func (r *renderer) fillWedgeRoundRectCallout(x, y, w, h int, c color.RGBA, adj map[string]int) {
+	adj1v := -20833
+	adj2v := 62500
+	adj3v := 16667
+	if adj != nil {
+		if v, ok := adj["adj1"]; ok {
+			adj1v = v
+		}
+		if v, ok := adj["adj2"]; ok {
+			adj2v = v
+		}
+		if v, ok := adj["adj3"]; ok {
+			adj3v = v
+		}
+	}
+	fw, fh := float64(w), float64(h)
+	ss := math.Min(fw, fh)
+	radius := int(ss * float64(adj3v) / 100000.0)
+	if radius < 0 {
+		radius = 0
+	}
+
+	// Draw the rounded rectangle body
+	r.fillRoundedRect(x, y, w, h, radius, c)
+
+	// Compute callout tip position (relative to shape top-left)
+	tipX := float64(x) + fw/2 + fw*float64(adj1v)/100000.0
+	tipY := float64(y) + fh/2 + fh*float64(adj2v)/100000.0
+
+	// Determine wedge base: two points on the nearest edge of the rectangle.
+	// The wedge base width is about 1/6 of the edge length.
+	fx, fy := float64(x), float64(y)
+	cx, cy := fx+fw/2, fy+fh/2
+
+	// Determine which edge the wedge originates from based on tip position
+	dx := tipX - cx
+	dy := tipY - cy
+	var bx1, by1, bx2, by2 float64
+	wedgeHalf := fw / 12 // half-width of wedge base
+
+	if math.Abs(dy)*fw >= math.Abs(dx)*fh {
+		// Tip is more above/below → wedge on top or bottom edge
+		wedgeHalf = fw / 12
+		baseCX := tipX
+		if baseCX < fx+float64(radius) {
+			baseCX = fx + float64(radius)
+		}
+		if baseCX > fx+fw-float64(radius) {
+			baseCX = fx + fw - float64(radius)
+		}
+		if dy >= 0 {
+			// Bottom edge
+			bx1, by1 = baseCX-wedgeHalf, fy+fh
+			bx2, by2 = baseCX+wedgeHalf, fy+fh
+		} else {
+			// Top edge
+			bx1, by1 = baseCX+wedgeHalf, fy
+			bx2, by2 = baseCX-wedgeHalf, fy
+		}
+	} else {
+		// Tip is more left/right → wedge on left or right edge
+		wedgeHalf = fh / 12
+		baseCY := tipY
+		if baseCY < fy+float64(radius) {
+			baseCY = fy + float64(radius)
+		}
+		if baseCY > fy+fh-float64(radius) {
+			baseCY = fy + fh - float64(radius)
+		}
+		if dx >= 0 {
+			// Right edge
+			bx1, by1 = fx+fw, baseCY-wedgeHalf
+			bx2, by2 = fx+fw, baseCY+wedgeHalf
+		} else {
+			// Left edge
+			bx1, by1 = fx, baseCY+wedgeHalf
+			bx2, by2 = fx, baseCY-wedgeHalf
+		}
+	}
+
+	// Draw the wedge triangle
+	wedge := []fpoint{
+		{bx1, by1},
+		{tipX, tipY},
+		{bx2, by2},
+	}
+	r.fillPolygon(wedge, c)
+}
+
+// drawWedgeRoundRectCalloutBorder draws the border of a wedgeRoundRectCallout shape.
+func (r *renderer) drawWedgeRoundRectCalloutBorder(x, y, w, h int, bc color.RGBA, pw int, adj map[string]int) {
+	adj1v := -20833
+	adj2v := 62500
+	adj3v := 16667
+	if adj != nil {
+		if v, ok := adj["adj1"]; ok {
+			adj1v = v
+		}
+		if v, ok := adj["adj2"]; ok {
+			adj2v = v
+		}
+		if v, ok := adj["adj3"]; ok {
+			adj3v = v
+		}
+	}
+	fw, fh := float64(w), float64(h)
+	ss := math.Min(fw, fh)
+	radius := int(ss * float64(adj3v) / 100000.0)
+	if radius < 0 {
+		radius = 0
+	}
+
+	tipX := float64(x) + fw/2 + fw*float64(adj1v)/100000.0
+	tipY := float64(y) + fh/2 + fh*float64(adj2v)/100000.0
+
+	fx, fy := float64(x), float64(y)
+	cx, cy := fx+fw/2, fy+fh/2
+	dx := tipX - cx
+	dy := tipY - cy
+
+	// Determine wedge base position and which edge it's on
+	type wedgeInfo struct {
+		bx1, by1, bx2, by2 float64
+		edge                int // 0=bottom, 1=top, 2=right, 3=left
+	}
+	var wi wedgeInfo
+	if math.Abs(dy)*fw >= math.Abs(dx)*fh {
+		wedgeHalf := fw / 12
+		baseCX := tipX
+		if baseCX < fx+float64(radius) {
+			baseCX = fx + float64(radius)
+		}
+		if baseCX > fx+fw-float64(radius) {
+			baseCX = fx + fw - float64(radius)
+		}
+		if dy >= 0 {
+			wi = wedgeInfo{baseCX - wedgeHalf, fy + fh, baseCX + wedgeHalf, fy + fh, 0}
+		} else {
+			wi = wedgeInfo{baseCX + wedgeHalf, fy, baseCX - wedgeHalf, fy, 1}
+		}
+	} else {
+		wedgeHalf := fh / 12
+		baseCY := tipY
+		if baseCY < fy+float64(radius) {
+			baseCY = fy + float64(radius)
+		}
+		if baseCY > fy+fh-float64(radius) {
+			baseCY = fy + fh - float64(radius)
+		}
+		if dx >= 0 {
+			wi = wedgeInfo{fx + fw, baseCY - wedgeHalf, fx + fw, baseCY + wedgeHalf, 2}
+		} else {
+			wi = wedgeInfo{fx, baseCY + wedgeHalf, fx, baseCY - wedgeHalf, 3}
+		}
+	}
+
+	// Draw rounded rect border with gap for wedge, then draw wedge lines.
+	// For simplicity, draw the full rounded rect border then overdraw the wedge.
+	r.drawRoundedRect(x, y, w, h, radius, bc, pw)
+
+	// Draw wedge lines from base points to tip
+	r.drawLineAA(int(wi.bx1), int(wi.by1), int(tipX), int(tipY), bc, pw)
+	r.drawLineAA(int(tipX), int(tipY), int(wi.bx2), int(wi.by2), bc, pw)
+}
+
 
 // snip2SameRectPoints computes the polygon points for a snip2SameRect shape.
 // In OOXML snip2SameRect, adj1 controls the bottom-left and bottom-right snip,
@@ -3541,21 +4017,21 @@ func (r *renderer) fillBentArrow(x, y, w, h int, c color.RGBA, adj map[string]in
 }
 
 func (r *renderer) fillUturnArrow(x, y, w, h int, c color.RGBA, adj map[string]int) {
-	// OOXML uturnArrow preset geometry.
-	// Two vertical shafts connected by a semicircular arc at the BOTTOM.
-	// The LEFT shaft has an arrowhead pointing UP.
+	// OOXML uturnArrow preset geometry (from presetShapeDefinitions.xml).
+	// Two vertical shafts connected by arcs at the TOP.
+	// The RIGHT shaft has an arrowhead pointing DOWN.
+	// The U-turn opening is at the BOTTOM.
 	//
-	// adj1 = shaft width (fraction of w / 100000)
-	// adj2 = arrowhead extra width beyond shaft (fraction of w / 100000)
-	// adj3 = arrowhead height (fraction of h / 100000)
-	// adj4 = horizontal span of U-turn (fraction of w / 100000) — distance
-	//        between outer edges of the two shafts
-	// adj5 = total height used (fraction of h / 100000)
+	// adj1 = shaft thickness (fraction of ss / 100000, default 25000)
+	// adj2 = arrowhead half-extra width (fraction of ss / 100000, default 25000)
+	// adj3 = arrowhead height (fraction of ss / 100000, default 25000)
+	// adj4 = bend diameter (fraction of ss / 100000, default 43750)
+	// adj5 = total height used (fraction of h / 100000, default 75000)
 	adj1v := 25000
 	adj2v := 25000
 	adj3v := 25000
 	adj4v := 43750
-	adj5v := 100000
+	adj5v := 75000
 	if adj != nil {
 		if v, ok := adj["adj1"]; ok {
 			adj1v = v
@@ -3574,260 +4050,141 @@ func (r *renderer) fillUturnArrow(x, y, w, h int, c color.RGBA, adj map[string]i
 		}
 	}
 
-	fx, fy := float64(x), float64(y)
-	fw, fh := float64(w), float64(h)
+	fw := float64(w)
+	fh := float64(h)
+	fx := float64(x)
+	fy := float64(y)
+	ss := math.Min(fw, fh)
 
-	shaftW := fw * float64(adj1v) / 100000.0
-	headExtra := fw * float64(adj2v) / 100000.0
-	headH := fh * float64(adj3v) / 100000.0
-	uWidth := fw * float64(adj4v) / 100000.0
-	totalH := fh * float64(adj5v) / 100000.0
+	// Guide calculations per OOXML spec
+	th := ss * float64(adj1v) / 100000.0  // shaft thickness
+	aw2 := ss * float64(adj2v) / 100000.0 // arrowhead half-extra-width
+	th2 := th / 2.0
+	dh2 := aw2 - th2 // arrowhead extension beyond shaft edge
+	y5 := fh * float64(adj5v) / 100000.0  // total height
+	ah := ss * float64(adj3v) / 100000.0   // arrowhead height
+	y4 := y5 - ah                          // arrowhead base y
 
-	// Two shafts side by side, connected by U-turn arc at bottom.
-	// Left shaft: x=0 to x=shaftW
-	// Right shaft: x=(uWidth-shaftW) to x=uWidth
-	leftOuter := fx
-	leftInner := fx + shaftW
-	rightOuter := fx + uWidth
-	rightInner := rightOuter - shaftW
-	if rightInner < leftInner {
-		rightInner = leftInner
+	x9 := fw - dh2
+	bw := x9 / 2.0
+	bs := math.Min(bw, y4)
+	maxAdj4 := bs * 100000.0 / ss
+	a4 := math.Min(float64(adj4v), maxAdj4)
+	if a4 < 0 {
+		a4 = 0
+	}
+	bd := ss * a4 / 100000.0  // bend diameter (arc radius)
+	bd3 := bd - th
+	bd2 := math.Max(bd3, 0)   // inner bend diameter
+
+	x3 := th + bd2
+	x8 := fw - aw2
+	x6 := x8 - aw2
+	x7 := x6 + dh2
+	x4 := x9 - bd
+
+	// Clamp values
+	if y4 < 0 {
+		y4 = 0
+	}
+	if y5 > fh {
+		y5 = fh
 	}
 
-	// Arc at BOTTOM connecting the two shafts
-	outerRx := uWidth / 2
-	gap := rightInner - leftInner
-	if gap < 0 {
-		gap = 0
-	}
-	innerRx := gap / 2
-	arcCX := (leftOuter + rightOuter) / 2
-
-	// Arc Ry: semicircular — use outerRx as Ry for a circular arc,
-	// but cap to available height after arrowhead.
-	availH := totalH - headH
-	outerRy := outerRx
-	if outerRy > availH*0.5 {
-		outerRy = availH * 0.5
-	}
-	if outerRy < 1 {
-		outerRy = 1
-	}
-	innerRy := outerRy * innerRx / outerRx
-	if outerRx == 0 {
-		innerRy = 0
-	}
-
-	shaftTop := fy
-	arcCY := fy + totalH - outerRy
-
-	// Arrowhead on LEFT shaft, pointing UP
-	arrowCenterX := (leftOuter + leftInner) / 2
-	halfHead := shaftW/2 + headExtra
-	arrowLeft := arrowCenterX - halfHead
-	arrowRight := arrowCenterX + halfHead
-	if arrowLeft < fx {
-		arrowLeft = fx
-	}
-	if arrowRight > fx+fw {
-		arrowRight = fx + fw
-	}
-	arrowTipY := shaftTop
-	arrowBaseY := shaftTop + headH
-
-	pts := make([]fpoint, 0, 80)
+	pts := make([]fpoint, 0, 100)
 	steps := 40
 
-	// Start: right shaft outer, from top going down to arc
-	pts = append(pts, fpoint{rightOuter, shaftTop})
-	pts = append(pts, fpoint{rightOuter, arcCY})
+	// Path per OOXML spec:
+	// 1. moveTo (0, h) - bottom-left
+	pts = append(pts, fpoint{fx, fy + fh})
 
-	// Outer arc (right to left, curving DOWN)
-	for i := 0; i <= steps; i++ {
-		angle := math.Pi * float64(i) / float64(steps)
-		px := arcCX + outerRx*math.Cos(angle)
-		py := arcCY + outerRy*math.Sin(angle)
-		pts = append(pts, fpoint{px, py})
-	}
+	// 2. lineTo (0, bd) - up left shaft
+	pts = append(pts, fpoint{fx, fy + bd})
 
-	// Left shaft outer, going up to arrowhead base
-	pts = append(pts, fpoint{leftOuter, arcCY})
-	pts = append(pts, fpoint{leftOuter, arrowBaseY})
-
-	// Arrowhead left wing
-	pts = append(pts, fpoint{arrowLeft, arrowBaseY})
-
-	// Arrow tip (pointing up)
-	pts = append(pts, fpoint{arrowCenterX, arrowTipY})
-
-	// Arrowhead right wing
-	pts = append(pts, fpoint{arrowRight, arrowBaseY})
-
-	// Left shaft inner, going down to arc
-	pts = append(pts, fpoint{leftInner, arrowBaseY})
-	pts = append(pts, fpoint{leftInner, arcCY})
-
-	// Inner arc (left to right, curving DOWN)
-	for i := steps; i >= 0; i-- {
-		angle := math.Pi * float64(i) / float64(steps)
-		px := arcCX + innerRx*math.Cos(angle)
-		py := arcCY + innerRy*math.Sin(angle)
-		pts = append(pts, fpoint{px, py})
-	}
-
-	// Right shaft inner, going up to top
-	pts = append(pts, fpoint{rightInner, arcCY})
-	pts = append(pts, fpoint{rightInner, shaftTop})
-
-	r.fillPolygon(pts, c)
-}
-
-// fillUturnArrowTransposed draws a U-turn arrow geometry transposed in the
-// w×h buffer. The adj fractions that normally use w now use h (visual width)
-// and those that use h now use w (visual height). The shafts run horizontally
-// (along X) and the U-turn arc is at the right side (high X).
-// This is used for 90°/270° rotations where the geometry needs to fill the
-// full buffer width to span the full visual height after rotation.
-func (r *renderer) fillUturnArrowTransposed(x, y, w, h int, c color.RGBA, adj map[string]int) {
-	adj1v := 25000
-	adj2v := 25000
-	adj3v := 25000
-	adj4v := 43750
-	adj5v := 100000
-	if adj != nil {
-		if v, ok := adj["adj1"]; ok {
-			adj1v = v
-		}
-		if v, ok := adj["adj2"]; ok {
-			adj2v = v
-		}
-		if v, ok := adj["adj3"]; ok {
-			adj3v = v
-		}
-		if v, ok := adj["adj4"]; ok {
-			adj4v = v
-		}
-		if v, ok := adj["adj5"]; ok {
-			adj5v = v
+	// 3. arcTo wR=bd, hR=bd, stAng=180°, swAng=90° (left-to-top arc)
+	// Arc center is at (bd, bd). Arc goes from 180° to 270° (CCW in screen coords = upward-right)
+	if bd > 0 {
+		arcCX := fx + bd
+		arcCY := fy + bd
+		for i := 0; i <= steps; i++ {
+			t := float64(i) / float64(steps)
+			angle := math.Pi + t*(math.Pi/2) // 180° to 270°
+			px := arcCX + bd*math.Cos(angle)
+			py := arcCY + bd*math.Sin(angle)
+			pts = append(pts, fpoint{px, py})
 		}
 	}
 
-	fx, fy := float64(x), float64(y)
-	fw, fh := float64(w), float64(h)
+	// 4. lineTo (x4, 0) - across the top
+	pts = append(pts, fpoint{fx + x4, fy})
 
-	// Transposed geometry: shafts run along X, arc connects them vertically.
-	// adj1/adj2/adj4 control Y-direction dimensions → use fh (short axis in buffer,
-	// becomes visual width after 270° rotation).
-	// adj3/adj5 control X-direction dimensions → use fw (long axis in buffer,
-	// becomes visual height after rotation, must span all boxes).
-	shaftW := fh * float64(adj1v) / 100000.0    // shaft thickness (Y direction)
-	headExtra := fh * float64(adj2v) / 100000.0 // extra arrowhead width beyond shaft
-	headH := fw * float64(adj3v) / 100000.0     // arrowhead length (X direction)
-	uWidth := fh * float64(adj4v) / 100000.0    // U-turn span between shafts (Y direction)
-	totalH := fw * float64(adj5v) / 100000.0    // total shaft length (X direction)
-
-	// Two shafts side by side in Y, running along X.
-	// U-turn arc at LEFT (low X), arrowhead at RIGHT (high X).
-	// After flipV + 270° CW rotation: left→top (U-turn at visual top),
-	// right→bottom (arrowhead at visual bottom). But original PPT shows
-	// arrowhead pointing UP and U-turn at bottom, so we need:
-	// arc at RIGHT (high X) → maps to visual bottom after rotation
-	// arrowhead at LEFT (low X) → maps to visual top after rotation
-	topOuter := fy
-	topInner := fy + shaftW
-	botOuter := fy + uWidth
-	botInner := botOuter - shaftW
-	if botInner < topInner {
-		botInner = topInner
+	// 5. arcTo wR=bd, hR=bd, stAng=270°, swAng=90° (top-to-right arc)
+	// Arc center is at (x4, bd). Arc goes from 270° to 360°
+	if bd > 0 {
+		arcCX := fx + x4
+		arcCY := fy + bd
+		for i := 0; i <= steps; i++ {
+			t := float64(i) / float64(steps)
+			angle := 3*math.Pi/2 + t*(math.Pi/2) // 270° to 360°
+			px := arcCX + bd*math.Cos(angle)
+			py := arcCY + bd*math.Sin(angle)
+			pts = append(pts, fpoint{px, py})
+		}
 	}
 
-	// Arc at RIGHT connecting the two shafts
-	outerRy := uWidth / 2
-	gap := botInner - topInner
-	if gap < 0 {
-		gap = 0
-	}
-	innerRy := gap / 2
-	arcCY := (topOuter + botOuter) / 2
+	// 6. lineTo (x9, y4) - down right shaft to arrowhead base
+	pts = append(pts, fpoint{fx + x9, fy + y4})
 
-	availW := totalH - headH
-	outerRx := outerRy // circular arc
-	if outerRx > availW*0.5 {
-		outerRx = availW * 0.5
-	}
-	if outerRx < 1 {
-		outerRx = 1
-	}
-	innerRx := outerRx * innerRy / outerRy
-	if outerRy == 0 {
-		innerRx = 0
-	}
+	// 7. lineTo (r, y4) - arrowhead right wing
+	pts = append(pts, fpoint{fx + fw, fy + y4})
 
-	shaftLeft := fx                // left edge (arrowhead end)
-	arcCX := fx + totalH - outerRx // arc center near right edge
+	// 8. lineTo (x8, y5) - arrowhead tip (pointing down)
+	pts = append(pts, fpoint{fx + x8, fy + y5})
 
-	// Arrowhead on TOP shaft, pointing LEFT (→ visual top after rotation)
-	arrowCenterY := (topOuter + topInner) / 2
-	halfHead := shaftW/2 + headExtra
-	arrowTop := arrowCenterY - halfHead
-	arrowBot := arrowCenterY + halfHead
-	if arrowTop < fy {
-		arrowTop = fy
-	}
-	if arrowBot > fy+fh {
-		arrowBot = fy + fh
-	}
-	arrowTipX := shaftLeft
-	arrowBaseX := shaftLeft + headH
+	// 9. lineTo (x6, y4) - arrowhead left wing
+	pts = append(pts, fpoint{fx + x6, fy + y4})
 
-	pts := make([]fpoint, 0, 80)
-	steps := 40
+	// 10. lineTo (x7, y4) - inner right shaft at arrowhead base
+	pts = append(pts, fpoint{fx + x7, fy + y4})
 
-	// Layout: arrowhead at LEFT (low X), U-turn arc at RIGHT (high X).
-	// Top shaft has the arrowhead; bottom shaft is plain.
-	// Outer path goes clockwise:
-	//   bottom-shaft left edge → right along bottom outer → arc curves RIGHT →
-	//   left along top outer → arrowhead → back along top inner →
-	//   arc inner curves RIGHT (reverse) → right along bottom inner → close
+	// 11. lineTo (x7, x3) - up inner right shaft to inner bend
+	pts = append(pts, fpoint{fx + x7, fy + x3})
 
-	// 1. Bottom shaft outer: left edge to arc
-	pts = append(pts, fpoint{shaftLeft, botOuter})
-	pts = append(pts, fpoint{arcCX, botOuter})
-
-	// 2. Outer arc: from bottom (botOuter) to top (topOuter), curving RIGHT
-	//    At angle -π/2 (bottom): cy + outerRy = botOuter ✓
-	//    At angle +π/2 (top):    cy - outerRy = topOuter ✓
-	for i := 0; i <= steps; i++ {
-		angle := -math.Pi/2 + math.Pi*float64(i)/float64(steps)
-		px := arcCX + outerRx*math.Cos(angle)
-		py := arcCY - outerRy*math.Sin(angle)
-		pts = append(pts, fpoint{px, py})
+	// 12. arcTo wR=bd2, hR=bd2, stAng=0°, swAng=-90° (inner arc, right-to-top)
+	// Arc center is at (x7-bd2, x3). Arc goes from 0° to -90° (= 270°)
+	if bd2 > 0 {
+		arcCX := fx + x7 - bd2
+		arcCY := fy + x3
+		for i := 0; i <= steps; i++ {
+			t := float64(i) / float64(steps)
+			angle := 0 - t*(math.Pi/2) // 0° to -90°
+			px := arcCX + bd2*math.Cos(angle)
+			py := arcCY + bd2*math.Sin(angle)
+			pts = append(pts, fpoint{px, py})
+		}
 	}
 
-	// 3. Top shaft outer: from arc to arrowhead base
-	pts = append(pts, fpoint{arcCX, topOuter})
-	pts = append(pts, fpoint{arrowBaseX, topOuter})
+	// 13. lineTo (x3, th) - across inner top
+	pts = append(pts, fpoint{fx + x3, fy + th})
 
-	// 4. Arrowhead pointing LEFT
-	pts = append(pts, fpoint{arrowBaseX, arrowTop})
-	pts = append(pts, fpoint{arrowTipX, arrowCenterY})
-	pts = append(pts, fpoint{arrowBaseX, arrowBot})
-
-	// 5. Top shaft inner: from arrowhead back to arc
-	pts = append(pts, fpoint{arrowBaseX, topInner})
-	pts = append(pts, fpoint{arcCX, topInner})
-
-	// 6. Inner arc: from top (topInner) to bottom (botInner), curving RIGHT (reverse)
-	for i := steps; i >= 0; i-- {
-		angle := -math.Pi/2 + math.Pi*float64(i)/float64(steps)
-		px := arcCX + innerRx*math.Cos(angle)
-		py := arcCY - innerRy*math.Sin(angle)
-		pts = append(pts, fpoint{px, py})
+	// 14. arcTo wR=bd2, hR=bd2, stAng=270°, swAng=-90° (inner arc, top-to-left)
+	// Arc center is at (x3, th+bd2). Arc goes from 270° to 180°
+	if bd2 > 0 {
+		arcCX := fx + x3
+		arcCY := fy + th + bd2
+		for i := 0; i <= steps; i++ {
+			t := float64(i) / float64(steps)
+			angle := 3*math.Pi/2 - t*(math.Pi/2) // 270° to 180°
+			px := arcCX + bd2*math.Cos(angle)
+			py := arcCY + bd2*math.Sin(angle)
+			pts = append(pts, fpoint{px, py})
+		}
 	}
 
-	// 7. Bottom shaft inner: from arc back to left edge
-	pts = append(pts, fpoint{arcCX, botInner})
-	pts = append(pts, fpoint{shaftLeft, botInner})
+	// 15. lineTo (th, h) - down inner left shaft to bottom
+	pts = append(pts, fpoint{fx + th, fy + fh})
+
+	// 16. close (implicit - polygon closes back to start)
 
 	r.fillPolygon(pts, c)
 }
@@ -4011,10 +4368,14 @@ func (r *renderer) buildTextLine(runs []textRun) textLine {
 	var tl textLine
 	tl.runs = runs
 	maxHeight := 0 // track font's recommended line-to-line height (includes line gap)
+	hasCJK := false
 	for _, run := range runs {
 		tl.width += run.width
 		if run.face == nil {
 			continue
+		}
+		if !hasCJK && containsCJK(run.text) {
+			hasCJK = true
 		}
 		metrics := run.face.Metrics()
 		asc := metrics.Ascent.Ceil()
@@ -4038,6 +4399,19 @@ func (r *renderer) buildTextLine(runs []textRun) textLine {
 	tl.lineHeight = maxHeight
 	if tl.lineHeight < tl.ascent+tl.descent {
 		tl.lineHeight = tl.ascent + tl.descent
+	}
+	// CJK fonts often report an excessively large metrics.Height (line gap)
+	// compared to what PowerPoint's DirectWrite renderer actually uses.
+	// Additionally, Go's truetype library reads ascent/descent from the OS/2
+	// table which produces values ~7-8% larger than what PowerPoint's
+	// DirectWrite renderer uses for CJK text. Cap the line height to 93% of
+	// (ascent+descent) to compensate, keeping font size unchanged.
+	if hasCJK {
+		adSum := tl.ascent + tl.descent
+		cjkHeight := int(math.Round(float64(adSum) * 0.93))
+		if tl.lineHeight > cjkHeight {
+			tl.lineHeight = cjkHeight
+		}
 	}
 	if tl.lineHeight < 1 {
 		tl.lineHeight = 14
@@ -4115,14 +4489,22 @@ func (r *renderer) measureParagraphsHeight(paragraphs []*Paragraph, w, h int, an
 				paraRuns = append(paraRuns, textRun{text: "\n"})
 			}
 		}
-		availW := w - marginLeft - marginRight - indent
-		if availW < 10 {
-			availW = w
+		baseW := w - marginLeft - marginRight
+		firstLineW := baseW - indent
+		if firstLineW < 10 {
+			firstLineW = w
+		}
+		if baseW < 10 {
+			baseW = w
 		}
 		if !wordWrap {
-			availW = 999999
+			firstLineW = 999999
+			baseW = 999999
 		}
-		lines := r.wrapRunLine(paraRuns, availW)
+		lines := r.wrapRunLine(paraRuns, baseW)
+		if indent != 0 && len(lines) > 0 && wordWrap {
+			lines = r.wrapRunLineWithIndent(paraRuns, firstLineW, baseW)
+		}
 		if len(lines) == 0 {
 			lines = []textLine{{lineHeight: 14}}
 		}
@@ -4156,6 +4538,93 @@ func (r *renderer) measureParagraphsHeight(paragraphs []*Paragraph, w, h int, an
 		totalH += li.spaceAfter
 	}
 	return totalH
+}
+
+// measureMaxLineWidth returns the maximum line width across all paragraphs
+// after word-wrapping. This is used to detect horizontal text overflow.
+func (r *renderer) measureMaxLineWidth(paragraphs []*Paragraph, w int, wordWrap bool) int {
+	if len(paragraphs) == 0 {
+		return 0
+	}
+	maxW := 0
+	for _, para := range paragraphs {
+		marginLeft := 0
+		marginRight := 0
+		indent := 0
+		if para.alignment != nil {
+			marginLeft = r.emuToPixelX(para.alignment.MarginLeft)
+			marginRight = r.emuToPixelX(para.alignment.MarginRight)
+			indent = r.emuToPixelX(para.alignment.Indent)
+		}
+		var paraRuns []textRun
+		if para.bullet != nil && para.bullet.Type != BulletTypeNone {
+			bRun := r.buildBulletRun(para.bullet, para)
+			if bRun.text != "" {
+				paraRuns = append(paraRuns, bRun)
+			}
+		}
+		for _, elem := range para.elements {
+			switch e := elem.(type) {
+			case *TextRun:
+				if e.text == "" {
+					continue
+				}
+				f := e.font
+				if f == nil {
+					f = NewFont()
+				}
+				if containsCJK(e.text) && r.fontCache != nil {
+					sizePt := float64(f.Size)
+					if sizePt <= 0 {
+						sizePt = 10
+					}
+					if r.fontScale > 0 && r.fontScale != 1.0 {
+						sizePt *= r.fontScale
+					}
+					scaledPt := sizePt * 12700.0 * r.scaleX
+					latinFace := r.fontCache.GetFace(f.Name, scaledPt, f.Bold, f.Italic)
+					if latinFace == nil {
+						latinFace = r.getFace(f)
+					}
+					cjkFace := r.getCJKFace(f)
+					subRuns := r.splitRunByCJK(e.text, f, latinFace, cjkFace)
+					paraRuns = append(paraRuns, subRuns...)
+				} else {
+					face := r.getFace(f)
+					paraRuns = append(paraRuns, textRun{
+						text:  e.text,
+						font:  f,
+						face:  face,
+						width: measureStringWithKern(face, e.text).Ceil(),
+					})
+				}
+			case *BreakElement:
+				paraRuns = append(paraRuns, textRun{text: "\n"})
+			}
+		}
+		baseW := w - marginLeft - marginRight
+		firstLineW := baseW - indent
+		if firstLineW < 10 {
+			firstLineW = w
+		}
+		if baseW < 10 {
+			baseW = w
+		}
+		if !wordWrap {
+			firstLineW = 999999
+			baseW = 999999
+		}
+		lines := r.wrapRunLine(paraRuns, baseW)
+		if indent != 0 && len(lines) > 0 && wordWrap {
+			lines = r.wrapRunLineWithIndent(paraRuns, firstLineW, baseW)
+		}
+		for _, line := range lines {
+			if line.width > maxW {
+				maxW = line.width
+			}
+		}
+	}
+	return maxW
 }
 
 // drawParagraphs renders paragraphs within the given bounding box.
@@ -4243,15 +4712,28 @@ func (r *renderer) drawParagraphs(paragraphs []*Paragraph, x, y, w, h int, ancho
 			}
 		}
 
-		// Wrap runs into lines
-		availW := w - marginLeft - marginRight - indent
-		if availW < 10 {
-			availW = w
+		// Wrap runs into lines.
+		// In PowerPoint, indent only affects the first line of a paragraph.
+		// Continuation lines use the full width minus margins only.
+		baseW := w - marginLeft - marginRight
+		firstLineW := baseW - indent
+		if firstLineW < 10 {
+			firstLineW = w
+		}
+		if baseW < 10 {
+			baseW = w
 		}
 		if !wordWrap {
-			availW = 999999
+			firstLineW = 999999
+			baseW = 999999
 		}
-		lines := r.wrapRunLine(paraRuns, availW)
+		// First, wrap using the continuation-line width (wider), then check
+		// if the first line exceeds the first-line width and re-wrap if needed.
+		lines := r.wrapRunLine(paraRuns, baseW)
+		if indent != 0 && len(lines) > 0 && wordWrap {
+			// Re-wrap with first-line width to handle indent correctly
+			lines = r.wrapRunLineWithIndent(paraRuns, firstLineW, baseW)
+		}
 		if len(lines) == 0 {
 			// Empty paragraph still takes space
 			lines = []textLine{{lineHeight: 14}}
@@ -4300,16 +4782,12 @@ func (r *renderer) drawParagraphs(paragraphs []*Paragraph, x, y, w, h int, ancho
 	switch anchor {
 	case TextAnchorMiddle:
 		startY = y + (h-totalH)/2
-		// When text overflows the available area, clamp to top so that
-		// text only overflows at the bottom (matching PowerPoint behaviour).
-		if startY < y {
-			startY = y
-		}
 	case TextAnchorBottom:
 		startY = y + h - totalH
-		if startY < y {
-			startY = y
-		}
+		// Do NOT clamp startY for bottom anchor. PowerPoint allows
+		// bottom-anchored text to overflow upward above the shape
+		// boundary, which is the expected behaviour for shapes like
+		// timeline annotation boxes.
 	}
 
 	curY := startY
@@ -4700,7 +5178,8 @@ func isCJKClosingPunct(r rune) bool {
 func isCJKOpeningPunct(r rune) bool {
 	switch r {
 	case '（', '【', '《', '「', '『', '〈', '〔', '｛', '［',
-		'(', '[', '{', '<':
+		'(', '[', '{', '<',
+		'\u201C', '\u2018': // " and '
 		return true
 	}
 	return false
@@ -4762,6 +5241,8 @@ func splitCJKAware(text string) []string {
 	}
 	// Apply kinsoku (禁則処理): merge closing punctuation into the preceding
 	// segment so it cannot start a new line.
+	// Also merge opening punctuation into the following segment so it cannot
+	// end a line.
 	if len(segments) > 1 {
 		merged := make([]string, 0, len(segments))
 		for i, seg := range segments {
@@ -4772,7 +5253,22 @@ func splitCJKAware(text string) []string {
 				merged = append(merged, seg)
 			}
 		}
-		segments = merged
+		// Second pass: merge opening punctuation with the following segment
+		if len(merged) > 1 {
+			merged2 := make([]string, 0, len(merged))
+			for i := 0; i < len(merged); i++ {
+				rs := []rune(merged[i])
+				if len(rs) == 1 && isCJKOpeningPunct(rs[0]) && i+1 < len(merged) {
+					// Merge opening punct with next segment
+					merged[i+1] = merged[i] + merged[i+1]
+				} else {
+					merged2 = append(merged2, merged[i])
+				}
+			}
+			segments = merged2
+		} else {
+			segments = merged
+		}
 	}
 	return segments
 }
@@ -4826,11 +5322,12 @@ func (r *renderer) wrapRunLine(runs []textRun, maxWidth int) []textLine {
 	}
 
 	maxW26_6 := fixed.I(maxWidth)
-	// Add a small tolerance (~1%) to account for differences between Go's
-	// text measurement and PowerPoint's DirectWrite renderer. Go's opentype
-	// package doesn't apply the same GPOS/GSUB shaping as DirectWrite,
-	// causing Latin text segments to measure slightly wider.
-	maxW26_6 += maxW26_6 / 100
+	// Add tolerance to account for differences between Go's text measurement
+	// and PowerPoint's DirectWrite renderer. Go's opentype package doesn't
+	// apply the same GPOS/GSUB shaping as DirectWrite, causing text segments
+	// (especially CJK) to measure wider. Use 6% tolerance to allow more
+	// characters per line, matching PowerPoint's wrapping behaviour.
+	maxW26_6 += maxW26_6 * 6 / 100
 
 	var lines []textLine
 	var currentRuns []textRun
@@ -4914,6 +5411,119 @@ func (r *renderer) wrapRunLine(runs []textRun, maxWidth int) []textLine {
 				width: pw.Ceil(),
 			}
 			currentRuns = append(currentRuns, wr)
+			currentWidth += pw
+		}
+	}
+
+	if len(currentRuns) > 0 {
+		lines = append(lines, r.buildTextLine(currentRuns))
+	}
+
+	return lines
+}
+
+// wrapRunLineWithIndent wraps text runs using different widths for the first
+// line (which includes the paragraph indent) and continuation lines.
+func (r *renderer) wrapRunLineWithIndent(runs []textRun, firstLineWidth, contLineWidth int) []textLine {
+	if len(runs) == 0 {
+		return nil
+	}
+	if firstLineWidth <= 0 {
+		firstLineWidth = 1
+	}
+	if contLineWidth <= 0 {
+		contLineWidth = 1
+	}
+
+	lineIdx := 0
+	getMaxW := func() fixed.Int26_6 {
+		w := contLineWidth
+		if lineIdx == 0 {
+			w = firstLineWidth
+		}
+		mw := fixed.I(w)
+		mw += mw * 6 / 100 // 6% tolerance for CJK glyph width differences
+		return mw
+	}
+
+	var lines []textLine
+	var currentRuns []textRun
+	var currentWidth fixed.Int26_6
+
+	for _, run := range runs {
+		if run.text == "\n" {
+			lines = append(lines, r.buildTextLine(currentRuns))
+			currentRuns = nil
+			currentWidth = 0
+			lineIdx++
+			continue
+		}
+		if run.face == nil {
+			continue
+		}
+
+		maxW := getMaxW()
+		runW := measureStringWithKern(run.face, run.text)
+
+		if currentWidth+runW <= maxW {
+			currentRuns = append(currentRuns, run)
+			currentWidth += runW
+			continue
+		}
+
+		if isClosingPunctRun(run.text) {
+			currentRuns = append(currentRuns, run)
+			currentWidth += runW
+			continue
+		}
+
+		segments := splitCJKAware(run.text)
+		if len(segments) <= 1 {
+			if len(currentRuns) > 0 {
+				lines = append(lines, r.buildTextLine(currentRuns))
+				currentRuns = nil
+				currentWidth = 0
+				lineIdx++
+			}
+			currentRuns = append(currentRuns, run)
+			currentWidth = runW
+			continue
+		}
+
+		var partial strings.Builder
+		for _, seg := range segments {
+			test := partial.String() + seg
+			tw := measureStringWithKern(run.face, test)
+			maxW = getMaxW()
+			if currentWidth+tw > maxW && (len(currentRuns) > 0 || partial.Len() > 0) {
+				if partial.Len() > 0 {
+					pText := partial.String()
+					currentRuns = append(currentRuns, textRun{
+						text:  pText,
+						font:  run.font,
+						face:  run.face,
+						width: measureStringWithKern(run.face, pText).Ceil(),
+					})
+				}
+				lines = append(lines, r.buildTextLine(currentRuns))
+				currentRuns = nil
+				currentWidth = 0
+				lineIdx++
+				partial.Reset()
+				partial.WriteString(seg)
+			} else {
+				partial.WriteString(seg)
+			}
+		}
+		if partial.Len() > 0 {
+			pText := partial.String()
+			pw := measureStringWithKern(run.face, pText)
+			currentRuns = append(currentRuns, textRun{
+				text:  pText,
+				font:  run.font,
+				face:  run.face,
+				width: pw.Ceil(),
+			})
 			currentWidth += pw
 		}
 	}
